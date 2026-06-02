@@ -1,9 +1,9 @@
 # BasuyuDB Helm values (K3s, ADR-018 / the design specs).
 
 image:
- repository: ghcr.io/cloudtasticdev/basuyudb
- tag: "0.1.0"
- pullPolicy: IfNotPresent
+  repository: ghcr.io/cloudtasticdev/basuyudb
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
 
 # 3-node Raft cluster by default (Gate 4). Set to 1 for a single-node pilot.
 replicaCount: 3
@@ -16,18 +16,18 @@ devMode: false
 encryptionKey: ""
 
 storage:
- # Local NVMe only — NOT network-attached (ADR-018). K3s ships local-path.
- storageClassName: local-path
- size: 300Gi
+  # Local NVMe only — NOT network-attached (ADR-018). K3s ships local-path.
+  storageClassName: local-path
+  size: 300Gi
 
 resources:
- # Guaranteed QoS: requests == limits (G-ADR-26). Memory limit ~2x working set.
- requests:
- cpu: "2"
- memory: 1Gi
- limits:
- cpu: "4"
- memory: 8Gi
+  # Guaranteed QoS: requests == limits (G-ADR-26). Memory limit ~2x working set.
+  requests:
+    cpu: "2"
+    memory: 1Gi
+  limits:
+    cpu: "4"
+    memory: 8Gi
 
 # terminationGracePeriodSeconds gives badger.DB.Close() + dragonboat shutdown
 # time to flush before SIGKILL (by design).
@@ -35,26 +35,26 @@ terminationGracePeriodSeconds: 90
 
 # PodDisruptionBudget keeps a Raft quorum during voluntary disruptions.
 podDisruptionBudget:
- enabled: true
- minAvailable: 2
+  enabled: true
+  minAvailable: 2
 
 # Anti-affinity is REQUIRED so replicas land on distinct nodes (by design).
 antiAffinity: required
 
 raft:
- rttMillisecond: 50
- electionRTT: 10 # 10 * 50ms = 500ms election timeout (ADR-018)
- heartbeatRTT: 1
+  rttMillisecond: 50
+  electionRTT: 10   # 10 * 50ms = 500ms election timeout (ADR-018)
+  heartbeatRTT: 1
 
 ports:
- pgWire: 5432
- otlpGrpc: 4317
- otlpHttp: 4318
- raft: 63001
- gossip: 7946
- management: 8080
+  pgWire: 5432
+  otlpGrpc: 4317
+  otlpHttp: 4318
+  raft: 63001
+  gossip: 7946
+  management: 8080
 
 service:
- type: ClusterIP
+  type: ClusterIP
 
 logLevel: info

@@ -21,9 +21,9 @@ The query no other database runs in one statement against one engine:
 ```sql
 -- Correlate an error span to the user who triggered it and what they were charged.
 SELECT s.trace_id, s.duration_ms, s.attributes ->> 'amount' AS amount, u.email
-FROM otel_spans s
-JOIN users u ON u.id = s.attributes ->> 'user_id'
-WHERE s.status = 'ERROR';
+FROM   otel_spans s
+JOIN   users u ON u.id = s.attributes ->> 'user_id'
+WHERE  s.status = 'ERROR';
 ```
 
 ## Capabilities (V0.1)
@@ -45,14 +45,14 @@ WHERE s.status = 'ERROR';
 ```
 PG wire (5432) ─┐
 OTLP gRPC (4317)─┤→ parser (goyacc, PG grammar) → executor ─┐
- │ ├→ transactions (Percolator + HLC)
- │ │ │ Commit → Propose
- │ │ ▼
- │ consensus (dragonboat Raft) ─→ state machine
- │ │ │ applies batch
- └────────────────────────────────────────────┴───────▼
- storage (managed BadgerDB, KeyEncoder)
- branch COW · HNSW vectors · bleve FTS · OTel spans
+                │                                            ├→ transactions (Percolator + HLC)
+                │                                            │       │ Commit → Propose
+                │                                            │       ▼
+                │                              consensus (dragonboat Raft) ─→ state machine
+                │                                            │       │ applies batch
+                └────────────────────────────────────────────┴───────▼
+                                              storage (managed BadgerDB, KeyEncoder)
+                                       branch COW · HNSW vectors · bleve FTS · OTel spans
 ```
 
 Every component is built against a single frozen contract set
@@ -76,9 +76,9 @@ psql -h localhost -p 5432 -U dev -d myapp -c "SELECT version();"
 ### Tests
 
 ```bash
-CGO_ENABLED=0 go build ./... # build / lint
-CGO_ENABLED=1 go test -race ./... # race detector requires CGo (Linux CI)
-CGO_ENABLED=0 go test ./... # functional tests
+CGO_ENABLED=0 go build ./...          # build / lint
+CGO_ENABLED=1 go test -race ./...     # race detector requires CGo (Linux CI)
+CGO_ENABLED=0 go test ./...           # functional tests
 ```
 
 ## Deploy (K3s)
