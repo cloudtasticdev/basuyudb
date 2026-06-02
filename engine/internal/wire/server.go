@@ -7,8 +7,10 @@ import (
 	"net"
 	"strings"
 
+	"github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/auth"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/executor"
+	"github.com/cloudtasticdev/basuyudb/engine/internal/parser"
 )
 
 // Server is the PG wire v3 listener.
@@ -113,9 +115,46 @@ func (c *conn) handleParse(body []byte) {
 	pos := 0
 	_ = cString(body, &pos) // destination prepared-statement name (unnamed)
 	c.parsedSQL = cString(body, &pos) // query string
-	// remaining: int16 numParamTypes + OIDs — ignored in milestone-1
+	// remaining: int16 numParamTypes + OIDs. The client may declare 0 and let us
+	// infer; either way the authoritative count is the highest $N in the SQL.
+	declared := 0
+	if pos+2 <= len(body) {
+		declared = int(int16(binary.BigEndian.Uint16(body[pos:])))
+	}
+	c.paramCount = countParams(c.parsedSQL)
+	if declared > c.paramCount {
+		c.paramCount = declared
+	}
 	c.boundParams = nil
 	c.mw.send(msgParseComplete, nil)
+}
+
+// countParams returns the highest $N parameter index in sql, ignoring $-runs
+// inside single-quoted string literals.
+func countParams(sql string) int {
+	max := 0
+	inStr := false
+	for i := 0; i < len(sql); i++ {
+		ch := sql[i]
+		if ch == '\'' {
+			inStr = !inStr
+			continue
+		}
+		if inStr || ch != '$' {
+			continue
+		}
+		j := i + 1
+		n := 0
+		for j < len(sql) && sql[j] >= '0' && sql[j] <= '9' {
+			n = n*10 + int(sql[j]-'0')
+			j++
+		}
+		if j > i+1 && n > max {
+			max = n
+		}
+		i = j - 1
+	}
+	return max
 }
 
 func (c *conn) handleBind(body []byte) {
@@ -144,7 +183,21 @@ func (c *conn) handleBind(body []byte) {
 		params = append(params, executor.Datum{Text: val})
 	}
 	c.boundParams = params
-	// (trailing result format codes ignored — text format only in milestone-1)
+
+	// Result format codes: int16 count, then a code per result column (or a
+	// single code applied to all). Honoured so binary-requesting drivers (pgx,
+	// and ORMs built on it) get binary-encoded results.
+	c.resultFormats = nil
+	if pos+2 <= len(body) {
+		nRes := int(int16(binary.BigEndian.Uint16(body[pos:])))
+		pos += 2
+		formats := make([]int16, 0, nRes)
+		for i := 0; i < nRes && pos+2 <= len(body); i++ {
+			formats = append(formats, int16(binary.BigEndian.Uint16(body[pos:])))
+			pos += 2
+		}
+		c.resultFormats = formats
+	}
 	c.mw.send(msgBindComplete, nil)
 }
 
@@ -155,9 +208,16 @@ func (c *conn) handleDescribe(body []byte) {
 	_ = cString(body, &pos) // name
 
 	if kind == 'S' {
-		// Statement describe: milestone-1 returns NoData (clients re-Describe the
-		// portal after Bind for row shape).
-		c.mw.send(msgNoData, nil)
+		// Statement describe: the driver needs the parameter count before Bind, and
+		// (for statement-caching drivers like pgx) the result row shape too. Send
+		// ParameterDescription, then RowDescription for a row-returning statement
+		// or NoData otherwise.
+		c.mw.send(msgParameterDesc, parameterDescription(c.paramCount))
+		if cols := c.describeColumns(); len(cols) > 0 {
+			c.mw.send(msgRowDescription, rowDescription(cols))
+		} else {
+			c.mw.send(msgNoData, nil)
+		}
 		return
 	}
 	// Portal describe: execute to learn the row shape.
@@ -173,6 +233,29 @@ func (c *conn) handleDescribe(body []byte) {
 	}
 }
 
+// describeColumns returns the result columns of a row-returning prepared
+// statement, probed by executing it with NULL parameters (read-only — only the
+// column shape is used). Non-SELECT statements return nil so the caller sends
+// NoData and never mutates at describe time.
+func (c *conn) describeColumns() []executor.Column {
+	stmt, err := parser.Parse(c.parsedSQL)
+	if err != nil {
+		return nil
+	}
+	if _, ok := stmt.(*ast.SelectStmt); !ok {
+		return nil
+	}
+	nullParams := make([]executor.Datum, c.paramCount)
+	for i := range nullParams {
+		nullParams[i] = executor.Datum{Null: true}
+	}
+	res, err := c.srv.exec.Execute(context.Background(), stmt, c.sess, nullParams)
+	if err != nil {
+		return nil
+	}
+	return res.Columns
+}
+
 func (c *conn) handleExecuteExtended(body []byte) {
 	pos := 0
 	_ = cString(body, &pos) // portal name
@@ -184,9 +267,9 @@ func (c *conn) handleExecuteExtended(body []byte) {
 		return
 	}
 	// In extended protocol, RowDescription was already sent at Describe; here we
-	// emit only DataRows + CommandComplete.
+	// emit only DataRows (in the client-requested format) + CommandComplete.
 	for _, row := range res.Rows {
-		c.mw.send(msgDataRow, dataRow(row))
+		c.mw.send(msgDataRow, dataRowFmt(row, res.Columns, c.resultFormats))
 	}
 	c.mw.send(msgCommandComplete, commandComplete(commandTag(res)))
 }

@@ -6,6 +6,7 @@ require (
 	github.com/blevesearch/bleve/v2 v2.6.0
 	github.com/coder/hnsw v0.6.1
 	github.com/dgraph-io/badger/v4 v4.5.0
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/lestrrat-go/jwx/v2 v2.1.1
 	github.com/lni/dragonboat/v4 v4.0.0-20250723143628-076c7f6497dc
 	go.opentelemetry.io/proto/otlp v1.3.1
@@ -63,6 +64,8 @@ require (
 	github.com/hashicorp/go-sockaddr v1.0.0 // indirect
 	github.com/hashicorp/golang-lru v0.5.1 // indirect
 	github.com/hashicorp/memberlist v0.3.1 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/json-iterator/go v1.1.9 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/kr/pretty v0.3.1 // indirect

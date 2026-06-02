@@ -2,11 +2,14 @@ package wire
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -38,6 +41,8 @@ type conn struct {
 	// extended-query state (one unnamed statement/portal, milestone-1)
 	parsedSQL string
 	boundParams []executor.Datum
+	paramCount int // number of $N parameters in the parsed statement
+	resultFormats []int16 // per-column result format codes from Bind (0 text, 1 binary)
 	// explicit (multi-statement) transaction state: tx is non-nil between BEGIN
 	// and COMMIT/ROLLBACK; txAborted is set when a statement errored inside it.
 	tx *transactions.Txn
@@ -397,6 +402,18 @@ func commandTag(res *executor.Result) string {
 }
 
 // rowDescription builds a 'T' message body for the given columns.
+// parameterDescription builds a 't' message body: the parameter count followed
+// by an OID per parameter. OID 0 means "unspecified" — the engine treats all
+// bound parameters as text, so it lets the driver infer types.
+func parameterDescription(n int) []byte {
+	var e builder
+	e.int16(int16(n))
+	for i := 0; i < n; i++ {
+		e.int32(0)
+	}
+	return e.b
+}
+
 func rowDescription(cols []executor.Column) []byte {
 	var e builder
 	e.int16(int16(len(cols)))
@@ -425,6 +442,78 @@ func dataRow(row []executor.Datum) []byte {
 		e.bytes([]byte(cell.Text))
 	}
 	return e.b
+}
+
+// dataRowFmt encodes a row honouring per-column result format codes (text or
+// binary) requested in Bind. The engine stores cells as PG text, so binary
+// output is produced by converting per the column's type OID.
+func dataRowFmt(row []executor.Datum, cols []executor.Column, formats []int16) []byte {
+	var e builder
+	e.int16(int16(len(row)))
+	for i, cell := range row {
+		if cell.Null {
+			e.int32(-1)
+			continue
+		}
+		if resultFormatFor(formats, i) == 1 {
+			b := encodeBinary(cell.Text, colTypeOID(cols, i))
+			e.int32(int32(len(b)))
+			e.bytes(b)
+			continue
+		}
+		e.int32(int32(len(cell.Text)))
+		e.bytes([]byte(cell.Text))
+	}
+	return e.b
+}
+
+func resultFormatFor(formats []int16, i int) int16 {
+	switch {
+	case len(formats) == 0:
+		return 0 // default text
+	case len(formats) == 1:
+		return formats[0] // one code applies to all columns
+	case i < len(formats):
+		return formats[i]
+	default:
+		return 0
+	}
+}
+
+func colTypeOID(cols []executor.Column, i int) uint32 {
+	if i < len(cols) {
+		return cols[i].TypeOID
+	}
+	return executor.OIDText
+}
+
+// encodeBinary converts a PG text value to PostgreSQL binary wire format for the
+// common scalar types; anything else falls back to its UTF-8 bytes.
+func encodeBinary(text string, oid uint32) []byte {
+	switch oid {
+	case executor.OIDInt4:
+		n, _ := strconv.ParseInt(text, 10, 64)
+		var b [4]byte
+		binary.BigEndian.PutUint32(b[:], uint32(int32(n)))
+		return b[:]
+	case executor.OIDInt8:
+		n, _ := strconv.ParseInt(text, 10, 64)
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(n))
+		return b[:]
+	case executor.OIDFloat8:
+		f, _ := strconv.ParseFloat(text, 64)
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], math.Float64bits(f))
+		return b[:]
+	case executor.OIDBool:
+		if text == "t" || text == "true" || text == "1" {
+			return []byte{1}
+		}
+		return []byte{0}
+	default:
+		return []byte(text)
+	}
 }
 
 func typeLen(oid uint32) int16 {

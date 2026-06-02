@@ -350,6 +350,22 @@ func (e *execImpl) projectRows(ctx context.Context, sess *session.Session, s *as
 // emptyResultColumns derives a column descriptor when the result set is empty
 // (so clients receive a RowDescription). Best-effort for milestone-4.
 func (e *execImpl) emptyResultColumns(ctx context.Context, sess *session.Session, s *ast.SelectStmt, star bool) []Column {
+	// Resolve the single base table's schema (if the FROM is one table) so that
+	// even an empty result set carries correct column types — drivers/ORMs that
+	// describe a prepared statement need this (a 0-row probe must still report
+	// `int`, not text).
+	var baseSch *tableSchema
+	if len(s.FromClause) == 1 {
+		if rv, ok := s.FromClause[0].(*ast.RangeVar); ok {
+			if txn, owns, err := e.beginTx(ctx, sess.Auth); err == nil {
+				if sch, err := e.resolveSchema(ctx, txn, sess, rv.RelName); err == nil {
+					baseSch = sch
+				}
+				e.rollbackTx(ctx, txn, owns)
+			}
+		}
+	}
+
 	if !star {
 		cols := make([]Column, len(s.TargetList))
 		for i, t := range s.TargetList {
@@ -357,23 +373,24 @@ func (e *execImpl) emptyResultColumns(ctx context.Context, sess *session.Session
 			if name == "" {
 				name = defaultColName(t.Val, i)
 			}
-			cols[i] = Column{Name: name, TypeOID: OIDText}
+			oid := uint32(OIDText)
+			// A bare column reference inherits its declared type from the schema.
+			if cr, ok := t.Val.(*ast.ColumnRef); ok && baseSch != nil && len(cr.Fields) > 0 {
+				if ci := baseSch.colIndex(cr.Fields[len(cr.Fields)-1]); ci >= 0 {
+					oid = baseSch.Cols[ci].TypeOID
+				}
+			}
+			cols[i] = Column{Name: name, TypeOID: oid}
 		}
 		return cols
 	}
-	// SELECT * with no rows: resolve the single base table's schema if possible.
-	if rv, ok := s.FromClause[0].(*ast.RangeVar); ok {
-		txn, owns, err := e.beginTx(ctx, sess.Auth)
-		if err == nil {
-			defer e.rollbackTx(ctx, txn, owns)
-			if sch, err := e.resolveSchema(ctx, txn, sess, rv.RelName); err == nil {
-				cols := make([]Column, len(sch.Cols))
-				for i, c := range sch.Cols {
-					cols[i] = Column{Name: c.Name, TypeOID: c.TypeOID}
-				}
-				return cols
-			}
+	// SELECT * with no rows: expand the base table's columns.
+	if baseSch != nil {
+		cols := make([]Column, len(baseSch.Cols))
+		for i, c := range baseSch.Cols {
+			cols[i] = Column{Name: c.Name, TypeOID: c.TypeOID}
 		}
+		return cols
 	}
 	return []Column{}
 }
