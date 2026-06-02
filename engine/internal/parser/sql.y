@@ -28,9 +28,10 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %token SELECT FROM WHERE AS JOIN INNER LEFT RIGHT FULL CROSS ON USING
 %token AND OR NOT NULL IS ORDER BY ASC DESC GROUP HAVING LIMIT OFFSET
 %token INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE PRIMARY KEY
+%token INDEX UNIQUE
 %token BRANCH MERGE DROP TRUE FALSE DISTINCT TYPECAST
 
-%type <node> stmt select_stmt insert_stmt update_stmt delete_stmt create_stmt
+%type <node> stmt select_stmt insert_stmt update_stmt delete_stmt create_stmt create_index_stmt
 %type <node> create_branch_stmt merge_branch_stmt drop_branch_stmt
 %type <node> expr table_ref from_item where_opt having_opt limit_opt offset_opt
 %type <nodes> from_clause from_list expr_list group_opt
@@ -76,6 +77,7 @@ stmt:
 	| update_stmt { $$ = $1 }
 	| delete_stmt { $$ = $1 }
 	| create_stmt { $$ = $1 }
+	| create_index_stmt { $$ = $1 }
 	| create_branch_stmt { $$ = $1 }
 	| merge_branch_stmt { $$ = $1 }
 	| drop_branch_stmt { $$ = $1 }
@@ -248,6 +250,12 @@ delete_stmt:
 create_stmt:
 	CREATE TABLE qualified_name '(' col_def_list ')'
 		{ $$ = &ast.CreateStmt{Relation: $3, TableElts: $5} }
+
+create_index_stmt:
+	CREATE INDEX IDENT ON qualified_name '(' name_list ')'
+		{ $$ = &ast.IndexStmt{Name: $3, Table: $5.RelName, Columns: $7} }
+	| CREATE UNIQUE INDEX IDENT ON qualified_name '(' name_list ')'
+		{ $$ = &ast.IndexStmt{Name: $4, Table: $6.RelName, Columns: $8, Unique: true} }
 
 col_def_list:
 	col_def

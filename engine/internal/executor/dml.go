@@ -124,11 +124,65 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 		}
 	}
 
+	// Secondary-index maintenance: enforce UNIQUE and write index entries.
+	defs, err := e.loadIndexes(ctx, txn, sess, table)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range defs {
+		if !d.Unique {
+			continue
+		}
+		ci := sch.colIndex(d.Column)
+		if ci < 0 || cells[ci].Null {
+			continue
+		}
+		dup, err := e.indexHasOtherPK(ctx, txn, sess, d, cells[ci].Text, primaryKeyBytes(sch, cells, rowKey))
+		if err != nil {
+			return nil, err
+		}
+		if dup {
+			return nil, newExecError("23505", "duplicate key value violates unique index %q", d.Name)
+		}
+	}
 	e.txn.Buffer(txn, transactions.Mutation{Key: rowKey, Value: encodeRow(cells)})
+	e.indexEntries(txn, sess, sch, defs, cells, rowKey, true)
 	if err := e.txn.Commit(ctx, txn); err != nil {
 		return nil, err
 	}
 	return &Result{Command: "INSERT", RowsAffected: 1}, nil
+}
+
+// indexHasOtherPK reports whether a unique index already maps value to a row
+// other than pk (used to enforce UNIQUE on insert/update).
+func (e *execImpl) indexHasOtherPK(ctx context.Context, txn *transactions.Txn, sess *session.Session, d indexDef, val string, pk []byte) (bool, error) {
+	prefix := e.store.Encoder().IndexValuePrefix(sess.Namespace(), sess.Branch(), d.Table, d.Column, []byte(val))
+	it := e.txn.NewIterator(txn, prefix)
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		// The index entry value is the owning row's pk. A live entry whose pk
+		// differs from this row's pk is a duplicate of the indexed value.
+		entryPK, err := it.Value()
+		if err != nil {
+			return false, err
+		}
+		if !bytesEqual(entryPK, pk) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // branchRowKey returns the key to write on the session's branch for a row,
@@ -158,8 +212,14 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 	}
 	sch := sc.schema
 
+	defs, err := e.loadIndexes(ctx, txn, sess, table)
+	if err != nil {
+		return nil, err
+	}
+
 	count := 0
 	for _, r := range sc.rows {
+		oldCells := append([]Datum(nil), r.cells...)
 		cells := append([]Datum(nil), r.cells...)
 		ev := &evaluator{params: params, resolveCol: rowResolver(sch, table, cells)}
 		if s.WhereClause != nil {
@@ -182,7 +242,27 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 			}
 			cells[idx] = Datum{Null: v.null, Text: v.text}
 		}
-		e.txn.Buffer(txn, transactions.Mutation{Key: e.branchRowKey(sess, table, sch, cells, r.key), Value: encodeRow(cells)})
+		// Enforce UNIQUE for changed indexed columns.
+		for _, d := range defs {
+			if !d.Unique {
+				continue
+			}
+			ci := sch.colIndex(d.Column)
+			if ci < 0 || cells[ci].Null || cells[ci].Text == oldCells[ci].Text {
+				continue
+			}
+			dup, err := e.indexHasOtherPK(ctx, txn, sess, d, cells[ci].Text, primaryKeyBytes(sch, cells, r.key))
+			if err != nil {
+				return nil, err
+			}
+			if dup {
+				return nil, newExecError("23505", "duplicate key value violates unique index %q", d.Name)
+			}
+		}
+		bk := e.branchRowKey(sess, table, sch, cells, r.key)
+		e.indexEntries(txn, sess, sch, defs, oldCells, r.key, false)
+		e.txn.Buffer(txn, transactions.Mutation{Key: bk, Value: encodeRow(cells)})
+		e.indexEntries(txn, sess, sch, defs, cells, r.key, true)
 		count++
 	}
 	if err := e.txn.Commit(ctx, txn); err != nil {
@@ -209,6 +289,11 @@ func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *sess
 	sch := sc.schema
 	onBranch := sess.Branch() != "main"
 
+	defs, err := e.loadIndexes(ctx, txn, sess, table)
+	if err != nil {
+		return nil, err
+	}
+
 	count := 0
 	for _, r := range sc.rows {
 		ev := &evaluator{params: params, resolveCol: rowResolver(sch, table, r.cells)}
@@ -227,6 +312,7 @@ func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *sess
 		} else {
 			e.txn.Buffer(txn, transactions.Mutation{Key: bk, Delete: true})
 		}
+		e.indexEntries(txn, sess, sch, defs, r.cells, r.key, false)
 		count++
 	}
 	if err := e.txn.Commit(ctx, txn); err != nil {

@@ -1,0 +1,21 @@
+# golangci-lint configuration for the BasuyuDB engine.
+#
+# The module targets go1.25, so CI builds golangci-lint from source with a
+# go1.25 toolchain (install-mode: goinstall in ci-go.yml) — the prebuilt
+# release binaries are built with go1.24 and cannot typecheck a go1.25 module.
+run:
+  timeout: 5m
+
+issues:
+  exclude-rules:
+    # Best-effort cleanup on read paths: deferred Close/Rollback errors are
+    # intentionally not propagated.
+    - linters: [errcheck]
+      source: "defer .*\\.(Close|Rollback)\\("
+    # PG wire protocol: msgWriter.send() buffers into a bufio.Writer; the real
+    # I/O error is surfaced by the following flush() (which errcheck already
+    # ignores for *bufio.Writer). Unchecked send() on response paths is by
+    # design — the connection is torn down when the subsequent flush() fails.
+    - path: internal/wire/
+      linters: [errcheck]
+      source: "\\.mw\\.send\\("

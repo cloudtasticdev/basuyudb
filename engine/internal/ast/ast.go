@@ -16,6 +16,7 @@ const (
 	T_UpdateStmt
 	T_DeleteStmt
 	T_CreateStmt
+	T_IndexStmt
 	T_CreateBranchStmt
 	T_MergeBranchStmt
 	T_DropBranchStmt
@@ -592,3 +593,14 @@ type ColumnDef struct {
 	PrimaryKey bool
 	Default Node // optional default expression
 }
+
+// IndexStmt — CREATE [UNIQUE] INDEX name ON table (col, ...).
+type IndexStmt struct {
+	Name    string
+	Table   string
+	Columns []string
+	Unique  bool
+}
+
+func (*IndexStmt) nodeTag() NodeTag                       { return T_IndexStmt }
+func (*IndexStmt) walkChildren(fn func(Node) error) error { return nil }

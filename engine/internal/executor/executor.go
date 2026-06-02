@@ -94,6 +94,8 @@ func (e *execImpl) Execute(ctx context.Context, stmt ast.Node, sess *session.Ses
 		return e.execSelect(ctx, s, sess, params)
 	case *ast.CreateStmt:
 		return e.execCreateTable(ctx, s, sess)
+	case *ast.IndexStmt:
+		return e.execCreateIndex(ctx, s, sess)
 	case *ast.InsertStmt:
 		return e.execInsert(ctx, s, sess, params)
 	case *ast.UpdateStmt:

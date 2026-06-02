@@ -6,6 +6,7 @@ import (
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/session"
+	"github.com/cloudtasticdev/basuyudb/engine/internal/storage"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/transactions"
 )
 
@@ -222,6 +223,155 @@ func usingEqual(row boundRow, cols []string) (bool, error) {
 	return true, nil
 }
 
+// tryIndexScan attempts to satisfy a single-table SELECT ... WHERE col = const
+// via a secondary-index point lookup instead of a full table scan. It returns
+// (rows, true, nil) when the index path was taken; (nil, false, nil) when the
+// query doesn't qualify and the caller should fall back to a full scan. The
+// WHERE predicate is still re-applied downstream, so this is a pure accelerator.
+//
+// V0.2 scope: main branch only (feature-branch index entries require COW
+// fall-through, deferred). Equality against a constant or bound parameter.
+func (e *execImpl) tryIndexScan(ctx context.Context, txn *transactions.Txn, sess *session.Session, s *ast.SelectStmt, params []Datum) ([]boundRow, bool, error) {
+	if sess.Branch() != "main" || s.WhereClause == nil || len(s.FromClause) != 1 {
+		return nil, false, nil
+	}
+	rv, ok := s.FromClause[0].(*ast.RangeVar)
+	if !ok || rv.RelName == OTelSpansTable {
+		return nil, false, nil
+	}
+	col, valNode, ok := equalityColConst(s.WhereClause)
+	if !ok {
+		return nil, false, nil
+	}
+
+	alias := rv.RelName
+	if rv.Alias != nil && rv.Alias.AliasName != "" {
+		alias = rv.Alias.AliasName
+	}
+	// The column reference must name this table (unqualified or alias/table-qualified).
+	if col.qualifier != "" && !strings.EqualFold(col.qualifier, alias) && !strings.EqualFold(col.qualifier, rv.RelName) {
+		return nil, false, nil
+	}
+
+	sch, err := e.resolveSchema(ctx, txn, sess, rv.RelName)
+	if err != nil {
+		return nil, false, nil // let the full-scan path surface the error
+	}
+	ci := sch.colIndex(col.name)
+	if ci < 0 {
+		return nil, false, nil
+	}
+
+	// Evaluate the constant/parameter to its text form.
+	ev := &evaluator{params: params}
+	cv, err := ev.eval(valNode)
+	if err != nil {
+		return nil, false, err
+	}
+	if cv.null {
+		return []boundRow{}, true, nil // col = NULL matches nothing
+	}
+
+	enc := e.store.Encoder()
+	alias2 := alias
+
+	// PK equality: the primary key IS the row key, so a single point-get serves
+	// the query with no secondary index (the cheapest possible path).
+	if sch.PKIndex == ci {
+		rowKey := enc.RowKey(sess.Namespace(), sess.Branch(), rv.RelName, []byte(cv.text))
+		raw, err := e.txn.Get(ctx, txn, rowKey)
+		if err != nil || storage.IsTombstone(raw) {
+			return []boundRow{}, true, nil // no such row
+		}
+		cells, err := decodeRow(raw, len(sch.Cols))
+		if err != nil {
+			return nil, false, err
+		}
+		return []boundRow{{{alias: alias2, schema: sch, cells: cells}}}, true, nil
+	}
+
+	defs, err := e.loadIndexes(ctx, txn, sess, rv.RelName)
+	if err != nil {
+		return nil, false, err
+	}
+	def, ok := findIndexOn(defs, col.name)
+	if !ok {
+		return nil, false, nil
+	}
+
+	prefix := enc.IndexValuePrefix(sess.Namespace(), sess.Branch(), def.Table, def.Column, []byte(cv.text))
+	it := e.txn.NewIterator(txn, prefix)
+	defer it.Close()
+
+	var out []boundRow
+	for it.Rewind(); it.Valid(); it.Next() {
+		pk, err := it.Value()
+		if err != nil {
+			return nil, false, err
+		}
+		rowKey := enc.RowKey(sess.Namespace(), sess.Branch(), def.Table, pk)
+		raw, err := e.txn.Get(ctx, txn, rowKey)
+		if err != nil {
+			continue // index entry without a live row (concurrent delete); skip
+		}
+		if storage.IsTombstone(raw) {
+			continue
+		}
+		cells, err := decodeRow(raw, len(sch.Cols))
+		if err != nil {
+			return nil, false, err
+		}
+		out = append(out, boundRow{{alias: alias, schema: sch, cells: cells}})
+	}
+	return out, true, nil
+}
+
+// colRef is a parsed column reference (optional table/alias qualifier + name).
+type colRef struct {
+	qualifier string
+	name      string
+}
+
+// equalityColConst matches a `col = const` (or `const = col`) predicate and
+// returns the column reference and the constant-side node.
+func equalityColConst(where ast.Node) (colRef, ast.Node, bool) {
+	ae, ok := where.(*ast.A_Expr)
+	if !ok || ae.Kind != ast.AEXPR_OP || ae.Name != "=" {
+		return colRef{}, nil, false
+	}
+	if c, ok := asColRef(ae.Lexpr); ok && isConstNode(ae.Rexpr) {
+		return c, ae.Rexpr, true
+	}
+	if c, ok := asColRef(ae.Rexpr); ok && isConstNode(ae.Lexpr) {
+		return c, ae.Lexpr, true
+	}
+	return colRef{}, nil, false
+}
+
+func asColRef(n ast.Node) (colRef, bool) {
+	cr, ok := n.(*ast.ColumnRef)
+	if !ok || len(cr.Fields) == 0 {
+		return colRef{}, false
+	}
+	last := cr.Fields[len(cr.Fields)-1]
+	if last == "*" {
+		return colRef{}, false
+	}
+	c := colRef{name: last}
+	if len(cr.Fields) > 1 {
+		c.qualifier = cr.Fields[len(cr.Fields)-2]
+	}
+	return c, true
+}
+
+func isConstNode(n ast.Node) bool {
+	switch n.(type) {
+	case *ast.A_Const, *ast.ParamRef:
+		return true
+	}
+	return false
+}
+
 // execSelectFrom scans/joins the FROM clause, applies WHERE, projects targets,
 // and applies LIMIT. (Single-table and JOIN share this path.)
 func (e *execImpl) execSelectFrom(ctx context.Context, s *ast.SelectStmt, sess *session.Session, params []Datum) (*Result, error) {
@@ -231,9 +381,15 @@ func (e *execImpl) execSelectFrom(ctx context.Context, s *ast.SelectStmt, sess *
 	}
 	defer e.txn.Rollback(ctx, txn)
 
-	rows, err := e.materialize(ctx, txn, sess, s.FromClause[0], params)
+	rows, used, err := e.tryIndexScan(ctx, txn, sess, s, params)
 	if err != nil {
 		return nil, err
+	}
+	if !used {
+		rows, err = e.materialize(ctx, txn, sess, s.FromClause[0], params)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Determine output columns. For SELECT *, expand every binding's columns.

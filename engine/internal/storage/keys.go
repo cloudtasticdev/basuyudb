@@ -50,6 +50,7 @@ type KeyEncoder interface {
 	RowKey(ns auth.NamespaceID, branch, table string, pk []byte) Key
 	RowPrefix(ns auth.NamespaceID, branch, table string) Key
 	IndexKey(ns auth.NamespaceID, branch, table, col string, val, pk []byte) Key
+	IndexValuePrefix(ns auth.NamespaceID, branch, table, col string, val []byte) Key
 	FTSKey(ns auth.NamespaceID, branch, table, field, term string, docID []byte) Key
 	VectorKey(ns auth.NamespaceID, branch, table, col string, id []byte) Key
 	OtelSpanKey(ns auth.NamespaceID, branch string, traceID, spanID []byte) Key
@@ -137,6 +138,19 @@ func (keyEncoder) IndexKey(ns auth.NamespaceID, branch, table, col string, val, 
 	b = appendStr(b, col)
 	b = appendBin(b, val)
 	b = appendBin(b, pk)
+	return rawKey(b)
+}
+
+// IndexValuePrefix returns the structural prefix matching every index entry for
+// a given (table, col, val): /ns/{ns}/{branch}/idx/{table}/{col}/<lp:val>. A
+// prefix scan over it yields all rows whose indexed column equals val.
+func (keyEncoder) IndexValuePrefix(ns auth.NamespaceID, branch, table, col string, val []byte) Key {
+	b := nsRoot(ns)
+	b = append(b, branchSegment(branch)...)
+	b = appendStr(b, "idx")
+	b = appendStr(b, table)
+	b = appendStr(b, col)
+	b = appendBin(b, val)
 	return rawKey(b)
 }
 

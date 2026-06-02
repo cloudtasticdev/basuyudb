@@ -30,7 +30,7 @@ func startTestServer(t *testing.T) string {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	go srv.Serve(ctx)
+	go func() { _ = srv.Serve(ctx) }()
 	t.Cleanup(func() {
 		cancel()
 		_ = srv.Close()
