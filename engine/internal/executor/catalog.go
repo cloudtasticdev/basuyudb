@@ -59,11 +59,11 @@ func (e *execImpl) loadSchema(ctx context.Context, txn *transactions.Txn, sess *
 func (e *execImpl) execCreateTable(ctx context.Context, c *ast.CreateStmt, sess *session.Session) (*Result, error) {
 	table := c.Relation.RelName
 
-	txn, err := e.txn.Begin(ctx, sess.Auth)
+	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
 		return nil, err
 	}
-	defer e.txn.Rollback(ctx, txn)
+	defer e.rollbackTx(ctx, txn, owns)
 
 	if _, err := e.loadSchema(ctx, txn, sess, table); err == nil {
 		return nil, newExecError("42P07", "relation %q already exists", table)
@@ -92,7 +92,7 @@ func (e *execImpl) execCreateTable(ctx context.Context, c *ast.CreateStmt, sess 
 	}
 	key := e.store.Encoder().SchemaKey(sess.Namespace(), table)
 	e.txn.Buffer(txn, transactions.Mutation{Key: key, Value: raw})
-	if err := e.txn.Commit(ctx, txn); err != nil {
+	if err := e.commitTx(ctx, txn, owns); err != nil {
 		return nil, err
 	}
 	return &Result{Command: "CREATE TABLE"}, nil

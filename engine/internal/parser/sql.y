@@ -30,8 +30,10 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %token INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE PRIMARY KEY
 %token INDEX UNIQUE
 %token BRANCH MERGE DROP TRUE FALSE DISTINCT TYPECAST
+%token ALTER TRUNCATE COLUMN ADD IF EXISTS IN
 
 %type <node> stmt select_stmt insert_stmt update_stmt delete_stmt create_stmt create_index_stmt
+%type <node> drop_table_stmt truncate_stmt alter_table_stmt
 %type <node> create_branch_stmt merge_branch_stmt drop_branch_stmt
 %type <node> expr table_ref from_item where_opt having_opt limit_opt offset_opt
 %type <nodes> from_clause from_list expr_list group_opt
@@ -50,6 +52,7 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %left AND
 %right NOT
 %nonassoc IS
+%nonassoc IN
 %left COMPARE_OP
 %left VECTOR_OP
 %left ADD_OP
@@ -78,6 +81,9 @@ stmt:
 	| delete_stmt { $$ = $1 }
 	| create_stmt { $$ = $1 }
 	| create_index_stmt { $$ = $1 }
+	| drop_table_stmt { $$ = $1 }
+	| truncate_stmt { $$ = $1 }
+	| alter_table_stmt { $$ = $1 }
 	| create_branch_stmt { $$ = $1 }
 	| merge_branch_stmt { $$ = $1 }
 	| drop_branch_stmt { $$ = $1 }
@@ -257,6 +263,28 @@ create_index_stmt:
 	| CREATE UNIQUE INDEX IDENT ON qualified_name '(' name_list ')'
 		{ $$ = &ast.IndexStmt{Name: $4, Table: $6.RelName, Columns: $8, Unique: true} }
 
+drop_table_stmt:
+	DROP TABLE qualified_name
+		{ $$ = &ast.DropStmt{Table: $3.RelName} }
+	| DROP TABLE IF EXISTS qualified_name
+		{ $$ = &ast.DropStmt{Table: $5.RelName, IfExists: true} }
+
+truncate_stmt:
+	TRUNCATE qualified_name
+		{ $$ = &ast.TruncateStmt{Table: $2.RelName} }
+	| TRUNCATE TABLE qualified_name
+		{ $$ = &ast.TruncateStmt{Table: $3.RelName} }
+
+alter_table_stmt:
+	ALTER TABLE qualified_name ADD COLUMN col_def
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterAddColumn, Column: $6} }
+	| ALTER TABLE qualified_name ADD col_def
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterAddColumn, Column: $5} }
+	| ALTER TABLE qualified_name DROP COLUMN IDENT
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterDropColumn, Column: ast.ColumnDef{ColName: $6}} }
+	| ALTER TABLE qualified_name DROP IDENT
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterDropColumn, Column: ast.ColumnDef{ColName: $5}} }
+
 col_def_list:
 	col_def
 		{ $$ = []ast.ColumnDef{$1} }
@@ -320,6 +348,16 @@ expr:
 		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3} }
 	| '(' expr ')'
 		{ $$ = $2 }
+	| '(' select_stmt ')'
+		{ $$ = &ast.SubLink{SubSelect: $2} }
+	| expr IN '(' select_stmt ')'
+		{ $$ = &ast.A_Expr{Kind: ast.AEXPR_IN, Lexpr: $1, Rexpr: &ast.SubLink{SubSelect: $4}} }
+	| expr IN '(' expr_list ')'
+		{ $$ = &ast.A_Expr{Kind: ast.AEXPR_IN, Lexpr: $1, Rexpr: &ast.List{Items: $4}} }
+	| expr NOT IN '(' select_stmt ')' %prec IN
+		{ $$ = &ast.BoolExpr{Op: ast.NOT_EXPR, Args: []ast.Node{&ast.A_Expr{Kind: ast.AEXPR_IN, Lexpr: $1, Rexpr: &ast.SubLink{SubSelect: $5}}}} }
+	| expr NOT IN '(' expr_list ')' %prec IN
+		{ $$ = &ast.BoolExpr{Op: ast.NOT_EXPR, Args: []ast.Node{&ast.A_Expr{Kind: ast.AEXPR_IN, Lexpr: $1, Rexpr: &ast.List{Items: $5}}}} }
 	| expr JSON_OP expr
 		{ $$ = &ast.A_Expr{Kind: ast.AEXPR_OP, Name: $2, Lexpr: $1, Rexpr: $3} }
 	| expr VECTOR_OP expr

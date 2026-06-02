@@ -41,6 +41,8 @@ var keywords = map[string]int{
 	"INDEX": INDEX, "UNIQUE": UNIQUE,
 	"BRANCH": BRANCH, "MERGE": MERGE, "DROP": DROP, "INTO_BRANCH": -1,
 	"TRUE": TRUE, "FALSE": FALSE, "DISTINCT": DISTINCT,
+	"ALTER": ALTER, "TRUNCATE": TRUNCATE, "COLUMN": COLUMN,
+	"ADD": ADD, "IF": IF, "EXISTS": EXISTS, "IN": IN,
 }
 
 // Lex implements the goyacc yyLexer interface. It scans the next token, fills

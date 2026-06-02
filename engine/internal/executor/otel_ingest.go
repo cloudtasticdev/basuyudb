@@ -34,11 +34,11 @@ func (e *execImpl) IngestSpans(ctx context.Context, sess *session.Session, spans
 	if len(spans) == 0 {
 		return nil
 	}
-	txn, err := e.txn.Begin(ctx, sess.Auth)
+	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
 		return err
 	}
-	defer e.txn.Rollback(ctx, txn)
+	defer e.rollbackTx(ctx, txn, owns)
 
 	enc := e.store.Encoder()
 	for _, s := range spans {
@@ -56,7 +56,7 @@ func (e *execImpl) IngestSpans(ctx context.Context, sess *session.Session, spans
 		key := enc.OtelSpanKey(sess.Namespace(), sess.Branch(), []byte(s.TraceID), []byte(s.SpanID))
 		e.txn.Buffer(txn, transactions.Mutation{Key: key, Value: encodeRow(cells)})
 	}
-	return e.txn.Commit(ctx, txn)
+	return e.commitTx(ctx, txn, owns)
 }
 
 func itoa(v int64) string {

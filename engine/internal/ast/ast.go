@@ -37,6 +37,10 @@ const (
 	T_SubLink
 	T_TypeCast
 	T_A_Star
+	T_DropStmt
+	T_TruncateStmt
+	T_AlterTableStmt
+	T_List
 )
 
 // Node is the single canonical AST interface. Every AST node implements it.
@@ -532,6 +536,22 @@ func (c *CommonTableExpr) walkChildren(fn func(Node) error) error {
 	return nil
 }
 
+// List — a parenthesised list of expressions, e.g. the right side of
+// `x IN (1, 2, 3)`.
+type List struct {
+	Items []Node
+}
+
+func (*List) nodeTag() NodeTag { return T_List }
+func (l *List) walkChildren(fn func(Node) error) error {
+	for _, it := range l.Items {
+		if err := fn(it); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SubLink — a subquery used as an expression or in FROM.
 type SubLink struct {
 	SubSelect Node // SelectStmt
@@ -604,3 +624,38 @@ type IndexStmt struct {
 
 func (*IndexStmt) nodeTag() NodeTag                       { return T_IndexStmt }
 func (*IndexStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// DropStmt — DROP TABLE [IF EXISTS] name.
+type DropStmt struct {
+	Table    string
+	IfExists bool
+}
+
+func (*DropStmt) nodeTag() NodeTag                       { return T_DropStmt }
+func (*DropStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// TruncateStmt — TRUNCATE [TABLE] name.
+type TruncateStmt struct {
+	Table string
+}
+
+func (*TruncateStmt) nodeTag() NodeTag                       { return T_TruncateStmt }
+func (*TruncateStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// AlterTableKind classifies an ALTER TABLE action.
+type AlterTableKind int32
+
+const (
+	AlterAddColumn AlterTableKind = iota
+	AlterDropColumn
+)
+
+// AlterTableStmt — ALTER TABLE name ADD COLUMN col type | DROP COLUMN col.
+type AlterTableStmt struct {
+	Table  string
+	Kind   AlterTableKind
+	Column ColumnDef // for ADD: full def; for DROP: only ColName is set
+}
+
+func (*AlterTableStmt) nodeTag() NodeTag                       { return T_AlterTableStmt }
+func (*AlterTableStmt) walkChildren(fn func(Node) error) error { return nil }

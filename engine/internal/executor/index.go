@@ -62,11 +62,11 @@ func (e *execImpl) execCreateIndex(ctx context.Context, s *ast.IndexStmt, sess *
 	}
 	col := s.Columns[0]
 
-	txn, err := e.txn.Begin(ctx, sess.Auth)
+	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
 		return nil, err
 	}
-	defer e.txn.Rollback(ctx, txn)
+	defer e.rollbackTx(ctx, txn, owns)
 
 	sch, err := e.loadSchema(ctx, txn, sess, s.Table)
 	if err != nil {
@@ -119,7 +119,7 @@ func (e *execImpl) execCreateIndex(ctx context.Context, s *ast.IndexStmt, sess *
 		e.txn.Buffer(txn, transactions.Mutation{Key: ik, Value: append([]byte(nil), pk...)})
 	}
 
-	if err := e.txn.Commit(ctx, txn); err != nil {
+	if err := e.commitTx(ctx, txn, owns); err != nil {
 		return nil, err
 	}
 	return &Result{Command: "CREATE INDEX"}, nil

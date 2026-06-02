@@ -4,7 +4,7 @@
 package version
 
 // Number is the semantic version of the engine (no leading "v").
-const Number = "0.3.0"
+const Number = "0.4.0"
 
 // PGWireServerVersion is the value reported for the PostgreSQL `server_version`
 // parameter and version() — it advertises PG-15 wire compatibility plus the

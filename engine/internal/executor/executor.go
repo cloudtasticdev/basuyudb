@@ -68,8 +68,16 @@ func newExecError(sqlstate, format string, a ...interface{}) *ExecError {
 // Executor runs canonical AST statements against managed storage.
 type Executor interface {
 	// Execute runs stmt within sess and returns its Result. params are the
-	// bound parameter values (PG text format) for $1..$N, or nil for none.
+	// bound parameter values (PG text format) for $1..$N, or nil for none. If
+	// ctx carries an explicit transaction (CtxWithTxn), the statement runs
+	// within it (no per-statement commit); otherwise it autocommits.
 	Execute(ctx context.Context, stmt ast.Node, sess *session.Session, params []Datum) (*Result, error)
+
+	// BeginExplicit / CommitExplicit / RollbackExplicit drive a multi-statement
+	// transaction for the wire layer's BEGIN / COMMIT / ROLLBACK.
+	BeginExplicit(ctx context.Context, sess *session.Session) (*transactions.Txn, error)
+	CommitExplicit(ctx context.Context, tx *transactions.Txn) error
+	RollbackExplicit(ctx context.Context, tx *transactions.Txn) error
 }
 
 // New constructs the canonical executor over a managed Store and the
@@ -96,6 +104,12 @@ func (e *execImpl) Execute(ctx context.Context, stmt ast.Node, sess *session.Ses
 		return e.execCreateTable(ctx, s, sess)
 	case *ast.IndexStmt:
 		return e.execCreateIndex(ctx, s, sess)
+	case *ast.DropStmt:
+		return e.execDropTable(ctx, s, sess)
+	case *ast.TruncateStmt:
+		return e.execTruncate(ctx, s, sess)
+	case *ast.AlterTableStmt:
+		return e.execAlterTable(ctx, s, sess)
 	case *ast.InsertStmt:
 		return e.execInsert(ctx, s, sess, params)
 	case *ast.UpdateStmt:

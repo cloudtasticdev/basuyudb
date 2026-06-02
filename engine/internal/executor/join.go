@@ -228,11 +228,11 @@ func usingEqual(row boundRow, cols []string) (bool, error) {
 // scan/JOIN. ORDER BY is applied in memory unless the index already produced the
 // requested order. (Single-table and JOIN share this path.)
 func (e *execImpl) execSelectFrom(ctx context.Context, s *ast.SelectStmt, sess *session.Session, params []Datum) (*Result, error) {
-	txn, err := e.txn.Begin(ctx, sess.Auth)
+	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
 		return nil, err
 	}
-	defer e.txn.Rollback(ctx, txn)
+	defer e.rollbackTx(ctx, txn, owns)
 
 	scan, err := e.planIndexScan(ctx, txn, sess, s, params)
 	if err != nil {
@@ -250,10 +250,11 @@ func (e *execImpl) execSelectFrom(ctx context.Context, s *ast.SelectStmt, sess *
 	}
 
 	// WHERE — re-applied even on the index path (the scan is a pure accelerator).
+	runSub := func(sel *ast.SelectStmt) (*Result, error) { return e.execSelect(ctx, sel, sess, params) }
 	kept := make([]boundRow, 0, len(rows))
 	for _, row := range rows {
 		if s.WhereClause != nil {
-			ev := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			ev := &evaluator{params: params, resolveCol: combinedResolver(row), runSub: runSub}
 			wv, err := ev.eval(s.WhereClause)
 			if err != nil {
 				return nil, err
@@ -263,6 +264,12 @@ func (e *execImpl) execSelectFrom(ctx context.Context, s *ast.SelectStmt, sess *
 			}
 		}
 		kept = append(kept, row)
+	}
+
+	// Aggregation (GROUP BY / aggregate functions) takes its own path: group,
+	// apply HAVING, project per group, then ORDER BY + LIMIT over the groups.
+	if needsAggregation(s) {
+		return e.execAggregate(ctx, sess, s, kept, params)
 	}
 
 	// ORDER BY — sort in memory unless the index already produced this order.
@@ -356,9 +363,9 @@ func (e *execImpl) emptyResultColumns(ctx context.Context, sess *session.Session
 	}
 	// SELECT * with no rows: resolve the single base table's schema if possible.
 	if rv, ok := s.FromClause[0].(*ast.RangeVar); ok {
-		txn, err := e.txn.Begin(ctx, sess.Auth)
+		txn, owns, err := e.beginTx(ctx, sess.Auth)
 		if err == nil {
-			defer e.txn.Rollback(ctx, txn)
+			defer e.rollbackTx(ctx, txn, owns)
 			if sch, err := e.resolveSchema(ctx, txn, sess, rv.RelName); err == nil {
 				cols := make([]Column, len(sch.Cols))
 				for i, c := range sch.Cols {

@@ -49,6 +49,12 @@ func decodeRow(b []byte, n int) ([]Datum, error) {
 	cells := make([]Datum, 0, n)
 	pos := 1 // skip the live-row tag
 	for i := 0; i < n; i++ {
+		if pos >= len(b) {
+			// Tuple was written before columns were added (online ALTER TABLE
+			// ADD COLUMN): missing trailing columns read as NULL.
+			cells = append(cells, Datum{Null: true})
+			continue
+		}
 		if pos+5 > len(b) {
 			return nil, newExecError("XX000", "corrupt row tuple: truncated header for column %d", i)
 		}

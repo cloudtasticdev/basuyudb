@@ -35,11 +35,11 @@ func rowResolver(sch *tableSchema, alias string, cells []Datum) func(fields []st
 func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *session.Session, params []Datum) (*Result, error) {
 	table := s.Relation.RelName
 
-	txn, err := e.txn.Begin(ctx, sess.Auth)
+	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
 		return nil, err
 	}
-	defer e.txn.Rollback(ctx, txn)
+	defer e.rollbackTx(ctx, txn, owns)
 
 	sch, err := e.resolveSchema(ctx, txn, sess, table)
 	if err != nil {
@@ -153,7 +153,7 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 	if err := e.indexEntries(txn, sess, sch, defs, cells, rowKey, true); err != nil {
 		return nil, err
 	}
-	if err := e.txn.Commit(ctx, txn); err != nil {
+	if err := e.commitTx(ctx, txn, owns); err != nil {
 		return nil, err
 	}
 	return &Result{Command: "INSERT", RowsAffected: 1}, nil
@@ -206,11 +206,11 @@ func (e *execImpl) branchRowKey(sess *session.Session, table string, sch *tableS
 // copy-on-write to the branch prefix (by design).
 func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *session.Session, params []Datum) (*Result, error) {
 	table := s.Relation.RelName
-	txn, err := e.txn.Begin(ctx, sess.Auth)
+	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
 		return nil, err
 	}
-	defer e.txn.Rollback(ctx, txn)
+	defer e.rollbackTx(ctx, txn, owns)
 
 	sc, err := e.scanTable(ctx, txn, sess, table, table)
 	if err != nil {
@@ -279,7 +279,7 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 		}
 		count++
 	}
-	if err := e.txn.Commit(ctx, txn); err != nil {
+	if err := e.commitTx(ctx, txn, owns); err != nil {
 		return nil, err
 	}
 	return &Result{Command: "UPDATE", RowsAffected: count}, nil
@@ -290,11 +290,11 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 // hidden without mutating the parent (by design).
 func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *session.Session, params []Datum) (*Result, error) {
 	table := s.Relation.RelName
-	txn, err := e.txn.Begin(ctx, sess.Auth)
+	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
 		return nil, err
 	}
-	defer e.txn.Rollback(ctx, txn)
+	defer e.rollbackTx(ctx, txn, owns)
 
 	sc, err := e.scanTable(ctx, txn, sess, table, table)
 	if err != nil {
@@ -331,7 +331,7 @@ func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *sess
 		}
 		count++
 	}
-	if err := e.txn.Commit(ctx, txn); err != nil {
+	if err := e.commitTx(ctx, txn, owns); err != nil {
 		return nil, err
 	}
 	return &Result{Command: "DELETE", RowsAffected: count}, nil

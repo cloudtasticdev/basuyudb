@@ -14,6 +14,7 @@ import (
 	"github.com/cloudtasticdev/basuyudb/engine/internal/executor"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/parser"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/session"
+	"github.com/cloudtasticdev/basuyudb/engine/internal/transactions"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/version"
 )
 
@@ -37,6 +38,10 @@ type conn struct {
 	// extended-query state (one unnamed statement/portal, milestone-1)
 	parsedSQL string
 	boundParams []executor.Datum
+	// explicit (multi-statement) transaction state: tx is non-nil between BEGIN
+	// and COMMIT/ROLLBACK; txAborted is set when a statement errored inside it.
+	tx *transactions.Txn
+	txAborted bool
 }
 
 func (s *Server) handleConn(nc net.Conn) {
@@ -55,6 +60,11 @@ func (s *Server) handleConn(nc net.Conn) {
 		return
 	}
 	c.loop()
+	// Roll back any transaction left open when the client disconnects.
+	if c.tx != nil {
+		_ = c.srv.exec.RollbackExplicit(context.Background(), c.tx)
+		c.tx = nil
+	}
 }
 
 // startup performs SSL negotiation, the startup packet, authentication, and the
@@ -211,37 +221,117 @@ func (c *conn) handleSimpleQuery(body []byte) {
 
 	if trimmed == "" {
 		c.mw.send(msgEmptyQuery, nil)
-		c.mw.send(msgReadyForQuery, readyForQuery('I'))
-		c.mw.flush()
+		c.endQuery()
 		return
 	}
-
-	if tag, handled := sessionControlTag(trimmed); handled {
-		c.mw.send(msgCommandComplete, commandComplete(tag))
-		c.mw.send(msgReadyForQuery, readyForQuery('I'))
-		c.mw.flush()
+	if c.handleControl(trimmed) {
+		c.endQuery()
+		return
+	}
+	// In an aborted transaction, every command except COMMIT/ROLLBACK is rejected.
+	if c.tx != nil && c.txAborted {
+		c.sendExecError(&executor.ExecError{SQLSTATE: "25P02", Msg: "current transaction is aborted, commands ignored until end of transaction block"})
+		c.endQuery()
 		return
 	}
 
 	res, err := c.execSQL(trimmed, nil)
 	if err != nil {
+		if c.tx != nil {
+			c.txAborted = true // PG: the transaction block fails as a whole
+		}
 		c.sendExecError(err)
-		c.mw.send(msgReadyForQuery, readyForQuery('I'))
-		c.mw.flush()
+		c.endQuery()
 		return
 	}
 	c.writeResult(res)
-	c.mw.send(msgReadyForQuery, readyForQuery('I'))
+	c.endQuery()
+}
+
+// endQuery flushes a ReadyForQuery whose status reflects the transaction state.
+func (c *conn) endQuery() {
+	c.mw.send(msgReadyForQuery, readyForQuery(c.txStatus()))
 	c.mw.flush()
 }
 
-// execSQL parses and executes one statement against the executor.
+// txStatus is the PG ReadyForQuery status byte: 'I' idle, 'T' in a transaction,
+// 'E' in a failed transaction block.
+func (c *conn) txStatus() byte {
+	switch {
+	case c.tx == nil:
+		return 'I'
+	case c.txAborted:
+		return 'E'
+	default:
+		return 'T'
+	}
+}
+
+// handleControl handles transaction control and no-op session statements,
+// returning true when the statement was a control command. BEGIN/COMMIT/
+// ROLLBACK drive a real multi-statement transaction.
+func (c *conn) handleControl(sql string) bool {
+	upper := strings.ToUpper(sql)
+	switch {
+	case strings.HasPrefix(upper, "BEGIN"), strings.HasPrefix(upper, "START TRANSACTION"):
+		if c.tx == nil {
+			tx, err := c.srv.exec.BeginExplicit(context.Background(), c.sess)
+			if err != nil {
+				c.sendExecError(err)
+				return true
+			}
+			c.tx, c.txAborted = tx, false
+		}
+		c.mw.send(msgCommandComplete, commandComplete("BEGIN"))
+		return true
+	case strings.HasPrefix(upper, "COMMIT"), strings.HasPrefix(upper, "END"):
+		if c.tx != nil {
+			var err error
+			if c.txAborted {
+				err = c.srv.exec.RollbackExplicit(context.Background(), c.tx)
+			} else {
+				err = c.srv.exec.CommitExplicit(context.Background(), c.tx)
+			}
+			c.tx, c.txAborted = nil, false
+			if err != nil {
+				c.sendExecError(err)
+				return true
+			}
+		}
+		c.mw.send(msgCommandComplete, commandComplete("COMMIT"))
+		return true
+	case strings.HasPrefix(upper, "ROLLBACK"), strings.HasPrefix(upper, "ABORT"):
+		if c.tx != nil {
+			_ = c.srv.exec.RollbackExplicit(context.Background(), c.tx)
+			c.tx, c.txAborted = nil, false
+		}
+		c.mw.send(msgCommandComplete, commandComplete("ROLLBACK"))
+		return true
+	case strings.HasPrefix(upper, "SET "):
+		c.mw.send(msgCommandComplete, commandComplete("SET"))
+		return true
+	case strings.HasPrefix(upper, "RESET "):
+		c.mw.send(msgCommandComplete, commandComplete("RESET"))
+		return true
+	case strings.HasPrefix(upper, "DISCARD"):
+		c.mw.send(msgCommandComplete, commandComplete("DISCARD ALL"))
+		return true
+	}
+	return false
+}
+
+// execSQL parses and executes one statement against the executor, joining the
+// active explicit transaction when one is open.
 func (c *conn) execSQL(sql string, params []executor.Datum) (*executor.Result, error) {
 	stmt, err := parser.Parse(sql)
 	if err != nil {
 		return nil, err
 	}
-	return c.srv.exec.Execute(context.Background(), stmt, c.sess, params)
+	ctx := context.Background()
+	if c.tx != nil {
+		ctx = executor.CtxWithTxn(ctx, c.tx)
+	}
+	return c.srv.exec.Execute(ctx, stmt, c.sess, params)
 }
 
 // writeResult emits RowDescription + DataRows + CommandComplete for a result.

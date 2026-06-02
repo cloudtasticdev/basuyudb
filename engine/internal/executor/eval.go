@@ -23,6 +23,11 @@ type value struct {
 type evaluator struct {
 	params []Datum
 	resolveCol func(fields []string) (value, error)
+	// group, when non-nil, is the set of rows in the current GROUP BY bucket;
+	// aggregate function calls (COUNT/SUM/AVG/MIN/MAX) reduce over it.
+	group []boundRow
+	// runSub, when non-nil, executes an (uncorrelated) scalar or IN subquery.
+	runSub func(*ast.SelectStmt) (*Result, error)
 }
 
 // asBool interprets a value as a SQL boolean for WHERE/HAVING/ON predicates.
@@ -55,6 +60,9 @@ func (ev *evaluator) eval(n ast.Node) (value, error) {
 
 	case *ast.A_Expr:
 		return ev.evalAExpr(e)
+
+	case *ast.SubLink:
+		return ev.evalScalarSub(e)
 
 	case *ast.FuncCall:
 		return ev.evalFunc(e)
@@ -157,6 +165,9 @@ func evalConst(c *ast.A_Const) value {
 // evalAExpr handles unary minus and binary arithmetic/comparison over numeric
 // and text constants. Comparison yields a bool; arithmetic yields int4/float8.
 func (ev *evaluator) evalAExpr(e *ast.A_Expr) (value, error) {
+	if e.Kind == ast.AEXPR_IN {
+		return ev.evalIn(e)
+	}
 	// Unary (Lexpr nil): currently only "-" / "+".
 	if e.Lexpr == nil {
 		r, err := ev.eval(e.Rexpr)
@@ -195,6 +206,12 @@ func (ev *evaluator) evalAExpr(e *ast.A_Expr) (value, error) {
 
 func (ev *evaluator) evalFunc(f *ast.FuncCall) (value, error) {
 	name := strings.ToLower(strings.Join(f.FuncName, "."))
+	if isAggregateName(name) {
+		if ev.group == nil {
+			return value{}, newExecError("42803", "aggregate function %q is not allowed here", name)
+		}
+		return evalAggregate(name, f, ev.group, ev.params)
+	}
 	switch name {
 	case "version":
 		return value{text: "BasuyuDB " + version.Number + " on PostgreSQL 15 wire protocol", oid: OIDText}, nil
