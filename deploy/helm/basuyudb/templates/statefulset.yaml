@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+ name: {{ include "basuyudb.fullname" . }}
+ labels:
+ {{- include "basuyudb.labels" . | nindent 4 }}
+spec:
+ serviceName: {{ include "basuyudb.fullname" . }}-headless
+ replicas: {{ .Values.replicaCount }}
+ podManagementPolicy: Parallel
+ selector:
+ matchLabels:
+ {{- include "basuyudb.selectorLabels" . | nindent 6 }}
+ template:
+ metadata:
+ labels:
+ {{- include "basuyudb.selectorLabels" . | nindent 8 }}
+ spec:
+ terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+ {{- if eq .Values.antiAffinity "required" }}
+ affinity:
+ podAntiAffinity:
+ requiredDuringSchedulingIgnoredDuringExecution:
+ - labelSelector:
+ matchLabels:
+ {{- include "basuyudb.selectorLabels" . | nindent 18 }}
+ topologyKey: kubernetes.io/hostname
+ {{- end }}
+ initContainers:
+ # Clear stale BadgerDB + dragonboat lock/temp files left by an ungraceful
+ # exit (OOMKill / SIGKILL), preventing CrashLoopBackOff on restart.
+ # MUST NOT reference MANIFEST-LOCK (does not exist in BadgerDB) — .
+ - name: clear-locks
+ image: busybox:1.36
+ command:
+ - /bin/sh
+ - -c
+ - |
+ rm -f /data/badger/LOCK
+ rm -f /data/raft/tan/LOCK
+ rm -f /data/raft/WAL/*.tmp
+ true
+ volumeMounts:
+ - name: data
+ mountPath: /data
+ containers:
+ - name: basuyudb
+ image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+ imagePullPolicy: {{ .Values.image.pullPolicy }}
+ ports:
+ - { name: pg-wire, containerPort: {{ .Values.ports.pgWire }} }
+ - { name: otlp-grpc, containerPort: {{ .Values.ports.otlpGrpc }} }
+ - { name: otlp-http, containerPort: {{ .Values.ports.otlpHttp }} }
+ - { name: raft, containerPort: {{ .Values.ports.raft }} }
+ - { name: gossip, containerPort: {{ .Values.ports.gossip }} }
+ - { name: mgmt, containerPort: {{ .Values.ports.management }} }
+ env:
+ - name: POD_NAME
+ valueFrom:
+ fieldRef:
+ fieldPath: metadata.name
+ - name: BASUYUDB_NODE_ID
+ valueFrom:
+ fieldRef:
+ fieldPath: metadata.name
+ - name: BASUYUDB_DATA_DIR
+ value: /data/badger
+ - name: BASUYUDB_RAFT_DIR
+ value: /data/raft
+ - name: BASUYUDB_PG_ADDR
+ value: ":{{ .Values.ports.pgWire }}"
+ - name: BASUYUDB_OTLP_GRPC_ADDR
+ value: ":{{ .Values.ports.otlpGrpc }}"
+ - name: BASUYUDB_MANAGEMENT_PORT
+ value: "{{ .Values.ports.management }}"
+ # a design decision: canonical key is BASUYUDB_DEV_MODE (never DEV_MODE).
+ - name: BASUYUDB_DEV_MODE
+ value: {{ .Values.devMode | quote }}
+ - name: BASUYUDB_LOG_LEVEL
+ value: {{ .Values.logLevel | quote }}
+ - name: BASUYUDB_RAFT_ELECTION_TIMEOUT_MS
+ value: "{{ mul .Values.raft.electionRTT .Values.raft.rttMillisecond }}"
+ {{- if .Values.encryptionKey }}
+ - name: BASUYUDB_ENCRYPTION_KEY
+ valueFrom:
+ secretKeyRef:
+ name: {{ include "basuyudb.fullname" . }}-encryption
+ key: key
+ {{- end }}
+ resources:
+ {{- toYaml .Values.resources | nindent 12 }}
+ readinessProbe:
+ tcpSocket:
+ port: pg-wire
+ initialDelaySeconds: 5
+ periodSeconds: 10
+ livenessProbe:
+ tcpSocket:
+ port: pg-wire
+ initialDelaySeconds: 15
+ periodSeconds: 20
+ lifecycle:
+ preStop:
+ exec:
+ # Sleep only (no SIGTERM here) — . The engine's own signal
+ # handler flushes BadgerDB on the real SIGTERM from kubelet.
+ command: ["/bin/sleep", "5"]
+ volumeMounts:
+ - name: data
+ mountPath: /data
+ volumeClaimTemplates:
+ - metadata:
+ name: data
+ spec:
+ accessModes: ["ReadWriteOnce"]
+ storageClassName: {{ .Values.storage.storageClassName }}
+ resources:
+ requests:
+ storage: {{ .Values.storage.size }}

@@ -1,0 +1,7 @@
+*.exe
+/engine/basuyudb
+/engine/bin/
+/data/
+*.vlog
+.DS_Store
+engine/internal/parser/y.output

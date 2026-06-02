@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "basuyudb.fullname" . }}
+  labels:
+    {{- include "basuyudb.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "basuyudb.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: pg-wire,   port: {{ .Values.ports.pgWire }},  targetPort: pg-wire }
+    - { name: otlp-grpc, port: {{ .Values.ports.otlpGrpc }}, targetPort: otlp-grpc }
+    - { name: otlp-http, port: {{ .Values.ports.otlpHttp }}, targetPort: otlp-http }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "basuyudb.fullname" . }}-headless
+  labels:
+    {{- include "basuyudb.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "basuyudb.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: raft,   port: {{ .Values.ports.raft }},   targetPort: raft }
+    - { name: gossip, port: {{ .Values.ports.gossip }}, targetPort: gossip }
+{{- if .Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "basuyudb.fullname" . }}
+  labels:
+    {{- include "basuyudb.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "basuyudb.selectorLabels" . | nindent 6 }}
+{{- end }}
