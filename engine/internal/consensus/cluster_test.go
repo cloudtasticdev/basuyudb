@@ -29,7 +29,7 @@ func TestThreeNodeReplicationAndFailover(t *testing.T) {
 	members := map[uint64]*member{}
 
 	for rid := uint64(1); rid <= 3; rid++ {
-		st, err := storage.Open(storage.Options{DataDir: t.TempDir()})
+		st, err := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 		if err != nil {
 			t.Fatal(err)
 		}

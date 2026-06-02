@@ -25,7 +25,7 @@ func sessOn(t *testing.T, branch string) *session.Session {
 // a feature branch are invisible to main, the branch sees main's data via COW
 // fall-through, and MERGE applies the branch's changes back to main.
 func TestGate2BranchCOW(t *testing.T) {
-	st, _ := storage.Open(storage.Options{DataDir: t.TempDir()})
+	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	defer st.Close()
 	ex := New(st, transactions.New(st, 1, nil))
 	ctx := context.Background()

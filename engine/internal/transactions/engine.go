@@ -82,7 +82,15 @@ func New(store storage.Store, nodeID uint64, committer Committer) TransactionEng
 		committer = LocalCommitter{}
 	}
 	e := &engine{store: store, hlc: NewHLC(nodeID), committer: committer}
-	e.clock.Store(1) // ts 0 is reserved
+	// Resume the timestamp oracle from the highest committed version persisted in
+	// the store. On a fresh store MaxVersion is 0 → start at 1 (ts 0 reserved).
+	// On reopen this ensures a read snapshot (clock.Load) sees all previously
+	// committed data and the next commit (clock.Add(1)) is strictly newer.
+	start := store.MaxVersion()
+	if start < 1 {
+		start = 1
+	}
+	e.clock.Store(start)
 	return e
 }
 

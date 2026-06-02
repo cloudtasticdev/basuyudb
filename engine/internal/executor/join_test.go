@@ -12,7 +12,7 @@ import (
 // from the span attributes. This is the query no other database can run in one
 // statement against one engine.
 func TestGate3OTelJoin(t *testing.T) {
-	st, _ := storage.Open(storage.Options{DataDir: t.TempDir()})
+	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	defer st.Close()
 	ex := New(st, transactions.New(st, 1, nil))
 	sess := testSession(t)
@@ -65,7 +65,7 @@ func TestJSONBExtraction(t *testing.T) {
 
 // TestLeftJoinNullFill verifies LEFT JOIN emits NULL-filled right columns.
 func TestLeftJoinNullFill(t *testing.T) {
-	st, _ := storage.Open(storage.Options{DataDir: t.TempDir()})
+	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	defer st.Close()
 	ex := New(st, transactions.New(st, 1, nil))
 	sess := testSession(t)

@@ -39,7 +39,7 @@ func run(t *testing.T, ex Executor, sess *session.Session, sql string, params ..
 // TestGate1SelectOne is the Gate-1 acceptance at the executor layer: SELECT 1
 // returns a single int4 column with value "1".
 func TestGate1SelectOne(t *testing.T) {
-	st, err := storage.Open(storage.Options{DataDir: t.TempDir()})
+	st, err := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestGate1SelectOne(t *testing.T) {
 
 // TestSelectExpressions exercises arithmetic, comparison, NULL, params, version().
 func TestSelectExpressions(t *testing.T) {
-	st, _ := storage.Open(storage.Options{DataDir: t.TempDir()})
+	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	defer st.Close()
 	ex := New(st, transactions.New(st, 1, nil))
 	sess := testSession(t)
@@ -100,7 +100,7 @@ func TestSelectExpressions(t *testing.T) {
 // TestRelationalCRUD exercises CREATE TABLE, INSERT, SELECT with WHERE,
 // UPDATE, and DELETE end-to-end against the managed store.
 func TestRelationalCRUD(t *testing.T) {
-	st, _ := storage.Open(storage.Options{DataDir: t.TempDir()})
+	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	defer st.Close()
 	ex := New(st, transactions.New(st, 1, nil))
 	sess := testSession(t)
@@ -156,7 +156,7 @@ func TestRelationalCRUD(t *testing.T) {
 
 // TestNotNullAndMissingTable verifies constraint + missing-relation errors.
 func TestNotNullAndMissingTable(t *testing.T) {
-	st, _ := storage.Open(storage.Options{DataDir: t.TempDir()})
+	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	defer st.Close()
 	ex := New(st, transactions.New(st, 1, nil))
 	sess := testSession(t)
