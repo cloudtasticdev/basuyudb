@@ -9,6 +9,8 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/cloudtasticdev/basuyudb/engine/internal/version"
 )
 
 // startTime records when the process started; used to compute uptime.
@@ -74,7 +76,7 @@ func buildHealthHandler(pgPool PGPinger) http.HandlerFunc {
 
 		resp := healthResponse{
 			Status: status,
-			Version: "0.1.0",
+			Version: version.Number,
 			Engine: engineStatus,
 			Timestamp: now.Format(time.RFC3339),
 			UptimeSeconds: uptime,

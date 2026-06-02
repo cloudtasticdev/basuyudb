@@ -21,6 +21,7 @@ import (
 	"github.com/cloudtasticdev/basuyudb/engine/internal/otel"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/storage"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/transactions"
+	"github.com/cloudtasticdev/basuyudb/engine/internal/version"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/wire"
 )
 
@@ -32,7 +33,7 @@ func main() {
 	devMode := envBool("BASUYUDB_DEV_MODE", false)
 
 	logger.Info("BasuyuDB starting",
-		"version", "0.1.0",
+		"version", version.Number,
 		"go_version", runtime.Version(),
 		"num_cpu", runtime.NumCPU(),
 		"dev_mode", devMode,

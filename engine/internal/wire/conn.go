@@ -14,6 +14,7 @@ import (
 	"github.com/cloudtasticdev/basuyudb/engine/internal/executor"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/parser"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/session"
+	"github.com/cloudtasticdev/basuyudb/engine/internal/version"
 )
 
 const (
@@ -110,7 +111,7 @@ func (c *conn) handleStartupV3(body []byte) error {
 		return err
 	}
 	for k, v := range map[string]string{
-		"server_version": "15.0 (BasuyuDB 0.1.0)",
+		"server_version": version.PGWireServerVersion,
 		"server_encoding": "UTF8",
 		"client_encoding": "UTF8",
 		"DateStyle": "ISO, MDY",

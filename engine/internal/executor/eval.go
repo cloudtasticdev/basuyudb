@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/ast"
+	"github.com/cloudtasticdev/basuyudb/engine/internal/version"
 )
 
 // value is an intermediate evaluation result with its PG type OID.
@@ -196,7 +197,7 @@ func (ev *evaluator) evalFunc(f *ast.FuncCall) (value, error) {
 	name := strings.ToLower(strings.Join(f.FuncName, "."))
 	switch name {
 	case "version":
-		return value{text: "BasuyuDB 0.1.0 on PostgreSQL 15 wire protocol", oid: OIDText}, nil
+		return value{text: "BasuyuDB " + version.Number + " on PostgreSQL 15 wire protocol", oid: OIDText}, nil
 	case "current_database":
 		return value{text: "defaultdb", oid: OIDText}, nil
 	case "current_schema":
