@@ -38,7 +38,7 @@ func (e *execImpl) dropTableData(ctx context.Context, txn *transactions.Txn, ses
 		return err
 	}
 	for _, d := range defs {
-		e.deletePrefix(txn, enc.IndexColumnPrefix(sess.Namespace(), sess.Branch(), d.Table, d.Column))
+		e.deletePrefix(txn, enc.IndexColumnPrefix(sess.Namespace(), sess.Branch(), d.Table, d.Name))
 	}
 	return nil
 }
@@ -149,8 +149,9 @@ func (e *execImpl) execAlterTable(ctx context.Context, s *ast.AlterTableStmt, se
 		}
 		kept := defs[:0]
 		for _, d := range defs {
-			if d.Column == s.Column.ColName {
-				e.deletePrefix(txn, e.store.Encoder().IndexColumnPrefix(sess.Namespace(), sess.Branch(), d.Table, d.Column))
+			if d.hasColumn(s.Column.ColName) {
+				// Any index covering the dropped column is dropped entirely.
+				e.deletePrefix(txn, e.store.Encoder().IndexColumnPrefix(sess.Namespace(), sess.Branch(), d.Table, d.Name))
 				continue
 			}
 			kept = append(kept, d)

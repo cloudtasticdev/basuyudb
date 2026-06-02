@@ -307,6 +307,19 @@ func (c *conn) handleControl(sql string) bool {
 		}
 		c.mw.send(msgCommandComplete, commandComplete("ROLLBACK"))
 		return true
+	case strings.HasPrefix(upper, "SET BRANCH"):
+		if c.tx != nil {
+			c.sendExecError(&executor.ExecError{SQLSTATE: "25001", Msg: "SET branch cannot run inside a transaction block"})
+			return true
+		}
+		if br, ok := parseSetBranch(sql); ok {
+			if err := c.sess.SetBranch(br); err != nil {
+				c.sendExecError(&executor.ExecError{SQLSTATE: "42501", Msg: err.Error()})
+				return true
+			}
+		}
+		c.mw.send(msgCommandComplete, commandComplete("SET"))
+		return true
 	case strings.HasPrefix(upper, "SET "):
 		c.mw.send(msgCommandComplete, commandComplete("SET"))
 		return true
@@ -318,6 +331,30 @@ func (c *conn) handleControl(sql string) bool {
 		return true
 	}
 	return false
+}
+
+// parseSetBranch extracts the branch name from `SET branch [=|TO] <value>`,
+// tolerating quotes and a trailing semicolon.
+func parseSetBranch(sql string) (string, bool) {
+	lower := strings.ToLower(sql)
+	idx := strings.Index(lower, "branch")
+	if idx < 0 {
+		return "", false
+	}
+	rest := strings.TrimSpace(sql[idx+len("branch"):])
+	rest = strings.TrimSpace(strings.TrimPrefix(rest, "="))
+	if len(rest) >= 3 && strings.EqualFold(rest[:3], "to ") {
+		rest = strings.TrimSpace(rest[3:])
+	}
+	rest = strings.TrimSuffix(strings.TrimSpace(rest), ";")
+	rest = strings.TrimSpace(rest)
+	rest = strings.TrimSuffix(strings.TrimPrefix(rest, "'"), "'")
+	rest = strings.TrimSuffix(strings.TrimPrefix(rest, "\""), "\"")
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
 }
 
 // execSQL parses and executes one statement against the executor, joining the

@@ -5,7 +5,11 @@
 // (by design)
 package session
 
-import "github.com/cloudtasticdev/basuyudb/engine/internal/auth"
+import (
+	"fmt"
+
+	"github.com/cloudtasticdev/basuyudb/engine/internal/auth"
+)
 
 // Session is threaded wire -> executor -> storage. It derives its identity from
 // auth.Session: it carries the validated RAW namespace string (NOT a hashed
@@ -15,6 +19,7 @@ type Session struct {
 	Auth auth.Session // the validated capability token
 	connID uint64
 	params map[string]string // PG startup parameters (incl. "branch")
+	overrideBranch string // set via `SET branch = '...'` mid-session
 }
 
 // New constructs a session from a validated auth.Session and the PG startup
@@ -38,10 +43,24 @@ func (s *Session) Branch() string {
 	if s.Auth.Branch != "" {
 		return s.Auth.Branch
 	}
+	if s.overrideBranch != "" {
+		return s.overrideBranch
+	}
 	if b, ok := s.params["branch"]; ok && b != "" {
 		return b
 	}
 	return "main"
+}
+
+// SetBranch switches the connection's active branch (the `SET branch = '...'`
+// statement). It is rejected when the session token pins a branch, so a scoped
+// token cannot escape its branch.
+func (s *Session) SetBranch(branch string) error {
+	if s.Auth.Branch != "" {
+		return fmt.Errorf("branch is pinned by the session token and cannot be changed")
+	}
+	s.overrideBranch = branch
+	return nil
 }
 
 // ConnID returns the connection identifier.

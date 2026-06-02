@@ -81,3 +81,41 @@ func TestTransactionReadYourWrites(t *testing.T) {
 	}
 	_ = ex.RollbackExplicit(bg, tx)
 }
+
+// TestTransactionScanReadYourWrites verifies full-table scans inside a
+// transaction reflect the transaction's own uncommitted inserts, updates, and
+// deletes (buffer-merged iterator).
+func TestTransactionScanReadYourWrites(t *testing.T) {
+	ex, done := newIdxExec(t)
+	defer done()
+	sess := testSession(t)
+	bg := context.Background()
+	run(t, ex, sess, "CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+	run(t, ex, sess, "INSERT INTO t (id, n) VALUES (1, 10)")
+
+	tx, _ := ex.BeginExplicit(bg, sess)
+	txCtx := CtxWithTxn(bg, tx)
+	exec(t, ex, txCtx, sess, "INSERT INTO t (id, n) VALUES (2, 20)")
+	exec(t, ex, txCtx, sess, "INSERT INTO t (id, n) VALUES (3, 30)")
+	exec(t, ex, txCtx, sess, "UPDATE t SET n = 999 WHERE id = 1")
+	exec(t, ex, txCtx, sess, "DELETE FROM t WHERE id = 2")
+
+	// Scan within the txn: committed row 1 (updated to 999), inserted row 3,
+	// deleted row 2 hidden. Expect 2 rows.
+	r := exec(t, ex, txCtx, sess, "SELECT id, n FROM t ORDER BY id")
+	if len(r.Rows) != 2 {
+		t.Fatalf("scan RYW: want 2 rows (1,3), got %d: %#v", len(r.Rows), r.Rows)
+	}
+	if r.Rows[0][0].Text != "1" || r.Rows[0][1].Text != "999" {
+		t.Fatalf("scan RYW: row 1 should reflect update to 999, got %#v", r.Rows[0])
+	}
+	if r.Rows[1][0].Text != "3" {
+		t.Fatalf("scan RYW: row 3 (inserted) missing, got %#v", r.Rows)
+	}
+	// Aggregate inside the txn also reflects uncommitted state.
+	c := exec(t, ex, txCtx, sess, "SELECT COUNT(*) FROM t")
+	if c.Rows[0][0].Text != "2" {
+		t.Fatalf("scan RYW: COUNT(*) want 2, got %s", c.Rows[0][0].Text)
+	}
+	_ = ex.RollbackExplicit(bg, tx)
+}

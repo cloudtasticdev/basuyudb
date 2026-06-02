@@ -132,6 +132,19 @@ func (e *execImpl) planIndexScan(ctx context.Context, txn *transactions.Txn, ses
 		return nil, nil // let the full-scan path surface the error
 	}
 
+	defs, err := e.loadIndexes(ctx, txn, sess, rv.RelName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Composite-index exact lookup: if WHERE has equality on every column of a
+	// multi-column index, do one tuple-keyed scan.
+	if s.SortClause == nil {
+		if scan, used, err := e.tryCompositeEquality(ctx, txn, sess, rv.RelName, alias, sch, defs, s.WhereClause, matchesRel, params); used || err != nil {
+			return scan, err
+		}
+	}
+
 	// Bounds from WHERE (a single comparison, or AND of comparisons on one col).
 	bounds, boundsOK := extractColBounds(s.WhereClause, matchesRel)
 
@@ -173,10 +186,6 @@ func (e *execImpl) planIndexScan(ctx context.Context, txn *transactions.Txn, ses
 		return &indexScan{rows: row, ordered: true}, nil
 	}
 
-	defs, err := e.loadIndexes(ctx, txn, sess, rv.RelName)
-	if err != nil {
-		return nil, err
-	}
 	def, ok := findIndexOn(defs, driveCol)
 	if !ok {
 		return nil, nil
@@ -184,7 +193,7 @@ func (e *execImpl) planIndexScan(ctx context.Context, txn *transactions.Txn, ses
 
 	colType := sch.Cols[ci].TypeOID
 	enc := e.store.Encoder()
-	colPrefix := enc.IndexColumnPrefix(sess.Namespace(), sess.Branch(), def.Table, def.Column).Bytes()
+	colPrefix := enc.IndexColumnPrefix(sess.Namespace(), sess.Branch(), def.Table, def.Name).Bytes()
 
 	// Encode the scan endpoints. startKey/stopKey are inclusive byte bounds;
 	// predicate strictness (> vs >=, < vs <=) is re-checked downstream.
@@ -223,6 +232,67 @@ func (e *execImpl) planIndexScan(ctx context.Context, txn *transactions.Txn, ses
 		return nil, err
 	}
 	return &indexScan{rows: rows, ordered: orderOK}, nil
+}
+
+// tryCompositeEquality serves a SELECT whose WHERE has equality on every column
+// of a multi-column index via one tuple-keyed scan. Returns used=false to fall
+// through to the single-column planner.
+func (e *execImpl) tryCompositeEquality(ctx context.Context, txn *transactions.Txn, sess *session.Session, table, alias string, sch *tableSchema, defs []indexDef, where ast.Node, matchesRel func(string) bool, params []Datum) (*indexScan, bool, error) {
+	eq := collectEqualities(where, matchesRel)
+	if len(eq) < 2 {
+		return nil, false, nil
+	}
+	eqSet := map[string]bool{}
+	for c := range eq {
+		eqSet[c] = true
+	}
+	def, ok := findIndexForEquality(defs, eqSet)
+	if !ok || len(def.Columns) < 2 {
+		return nil, false, nil
+	}
+	// Build the tuple from the equality constants in index-column order.
+	var tuple []byte
+	for _, col := range def.Columns {
+		text := eq[strings.ToLower(col)]
+		part, err := orderEncode(sch.Cols[sch.colIndex(col)].TypeOID, text)
+		if err != nil {
+			return nil, false, err
+		}
+		tuple = append(tuple, part...)
+	}
+	enc := e.store.Encoder()
+	colPrefix := enc.IndexColumnPrefix(sess.Namespace(), sess.Branch(), def.Table, def.Name).Bytes()
+	loKey := append(append([]byte(nil), colPrefix...), tuple...)
+	hiKey := append(append([]byte(nil), loKey...), 0xFF)
+	rows, err := e.scanIndexRange(ctx, txn, sess, table, alias, sch, colPrefix, loKey, hiKey, false, -1)
+	if err != nil {
+		return nil, false, err
+	}
+	return &indexScan{rows: rows, ordered: false}, true, nil
+}
+
+// collectEqualities gathers all `col = const` equalities (lower-cased column →
+// constant text) from a WHERE clause that is a comparison or an AND of them.
+func collectEqualities(where ast.Node, matchesRel func(string) bool) map[string]string {
+	out := map[string]string{}
+	var walk func(n ast.Node)
+	walk = func(n ast.Node) {
+		switch e := n.(type) {
+		case *ast.BoolExpr:
+			if e.Op == ast.AND_EXPR {
+				for _, a := range e.Args {
+					walk(a)
+				}
+			}
+		case *ast.A_Expr:
+			b, ok := boundFromComparison(e, matchesRel)
+			if ok && b.hasLo && b.hasHi && b.loText == b.hiText {
+				out[strings.ToLower(b.col)] = b.loText
+			}
+		}
+	}
+	walk(where)
+	return out
 }
 
 // scanIndexRange iterates the index column between loKey and hiKey (inclusive

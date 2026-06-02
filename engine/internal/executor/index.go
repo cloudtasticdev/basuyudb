@@ -12,14 +12,43 @@ import (
 	"github.com/cloudtasticdev/basuyudb/engine/internal/transactions"
 )
 
-// indexDef is a persisted secondary-index definition. V0.2 supports
-// single-column indexes (the common point-lookup case); multi-column indexes
-// are a later extension.
+// indexDef is a persisted secondary-index definition. Columns holds one or more
+// indexed columns (composite). Index entries are keyed under the index name and
+// carry the concatenated memcomparable encoding of the columns (ADR-022).
 type indexDef struct {
-	Name   string `json:"name"`
-	Table  string `json:"table"`
-	Column string `json:"column"`
-	Unique bool   `json:"unique"`
+	Name    string   `json:"name"`
+	Table   string   `json:"table"`
+	Columns []string `json:"columns"`
+	Unique  bool     `json:"unique"`
+}
+
+// hasColumn reports whether the index covers the named column.
+func (d indexDef) hasColumn(col string) bool {
+	for _, c := range d.Columns {
+		if strings.EqualFold(c, col) {
+			return true
+		}
+	}
+	return false
+}
+
+// encodeIndexTuple concatenates the memcomparable encodings of an index's
+// columns for a row. Each per-type encoding is prefix-free, so the concatenation
+// orders correctly as a tuple. Returns ok=false if any indexed column is NULL
+// (NULLs are not indexed).
+func encodeIndexTuple(sch *tableSchema, columns []string, cells []Datum) (enc []byte, ok bool, err error) {
+	for _, col := range columns {
+		ci := sch.colIndex(col)
+		if ci < 0 || cells[ci].Null {
+			return nil, false, nil
+		}
+		part, e := orderEncode(sch.Cols[ci].TypeOID, cells[ci].Text)
+		if e != nil {
+			return nil, false, e
+		}
+		enc = append(enc, part...)
+	}
+	return enc, true, nil
 }
 
 // indexListKey stores the JSON array of a table's index definitions under the
@@ -44,23 +73,48 @@ func (e *execImpl) loadIndexes(ctx context.Context, txn *transactions.Txn, sess 
 	return defs, nil
 }
 
-// findIndexOn returns the index covering exactly column col, if any.
+// findIndexOn returns an index whose LEADING column is col (usable for a
+// single-column range or ORDER BY on col), preferring a single-column index.
 func findIndexOn(defs []indexDef, col string) (indexDef, bool) {
+	var leading indexDef
+	found := false
 	for _, d := range defs {
-		if strings.EqualFold(d.Column, col) {
-			return d, true
+		if len(d.Columns) == 1 && strings.EqualFold(d.Columns[0], col) {
+			return d, true // exact single-column index — best
+		}
+		if !found && len(d.Columns) > 0 && strings.EqualFold(d.Columns[0], col) {
+			leading, found = d, true
 		}
 	}
-	return indexDef{}, false
+	return leading, found
+}
+
+// findIndexForEquality returns an index all of whose columns have an equality
+// constraint in eqCols (a full composite-key lookup), preferring more columns.
+func findIndexForEquality(defs []indexDef, eqCols map[string]bool) (indexDef, bool) {
+	best := indexDef{}
+	found := false
+	for _, d := range defs {
+		all := len(d.Columns) > 0
+		for _, c := range d.Columns {
+			if !eqCols[strings.ToLower(c)] {
+				all = false
+				break
+			}
+		}
+		if all && len(d.Columns) > len(best.Columns) {
+			best, found = d, true
+		}
+	}
+	return best, found
 }
 
 // execCreateIndex persists an index definition and back-fills it by scanning
 // the existing rows and writing one IndexKey entry per row.
 func (e *execImpl) execCreateIndex(ctx context.Context, s *ast.IndexStmt, sess *session.Session) (*Result, error) {
-	if len(s.Columns) != 1 {
-		return nil, newExecError("0A000", "only single-column indexes are supported in V0.2")
+	if len(s.Columns) == 0 {
+		return nil, newExecError("42601", "index must name at least one column")
 	}
-	col := s.Columns[0]
 
 	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
@@ -72,8 +126,10 @@ func (e *execImpl) execCreateIndex(ctx context.Context, s *ast.IndexStmt, sess *
 	if err != nil {
 		return nil, err
 	}
-	if sch.colIndex(col) < 0 {
-		return nil, newExecError("42703", "column %q does not exist in %q", col, s.Table)
+	for _, col := range s.Columns {
+		if sch.colIndex(col) < 0 {
+			return nil, newExecError("42703", "column %q does not exist in %q", col, s.Table)
+		}
 	}
 
 	defs, err := e.loadIndexes(ctx, txn, sess, s.Table)
@@ -85,7 +141,7 @@ func (e *execImpl) execCreateIndex(ctx context.Context, s *ast.IndexStmt, sess *
 			return nil, newExecError("42P07", "index %q already exists", s.Name)
 		}
 	}
-	defs = append(defs, indexDef{Name: s.Name, Table: s.Table, Column: col, Unique: s.Unique})
+	defs = append(defs, indexDef{Name: s.Name, Table: s.Table, Columns: s.Columns, Unique: s.Unique})
 
 	raw, err := json.Marshal(defs)
 	if err != nil {
@@ -93,29 +149,28 @@ func (e *execImpl) execCreateIndex(ctx context.Context, s *ast.IndexStmt, sess *
 	}
 	e.txn.Buffer(txn, transactions.Mutation{Key: e.indexListKey(sess, s.Table), Value: raw})
 
-	// Back-fill: scan current rows and write index entries.
+	// Back-fill: scan current rows and write one tuple-keyed entry per row.
 	sc, err := e.scanTable(ctx, txn, sess, s.Table, s.Table)
 	if err != nil {
 		return nil, err
 	}
-	colIdx := sch.colIndex(col)
 	seen := map[string]bool{}
 	for _, r := range sc.rows {
-		val := r.cells[colIdx]
-		if s.Unique && !val.Null {
-			if seen[val.Text] {
-				return nil, newExecError("23505", "could not create unique index %q: duplicate value %q", s.Name, val.Text)
-			}
-			seen[val.Text] = true
-		}
-		pk := primaryKeyBytes(sch, r.cells, r.key)
-		encVal, err := orderEncode(sch.Cols[colIdx].TypeOID, val.Text)
+		encTuple, ok, err := encodeIndexTuple(sch, s.Columns, r.cells)
 		if err != nil {
 			return nil, err
 		}
-		ik := e.store.Encoder().IndexKey(sess.Namespace(), sess.Branch(), s.Table, col, encVal, pk)
-		// The entry value carries the row's pk so an index scan fetches the row
-		// with a single point-get (no key parsing).
+		if !ok {
+			continue // a NULL column: not indexed
+		}
+		if s.Unique {
+			if seen[string(encTuple)] {
+				return nil, newExecError("23505", "could not create unique index %q: duplicate key", s.Name)
+			}
+			seen[string(encTuple)] = true
+		}
+		pk := primaryKeyBytes(sch, r.cells, r.key)
+		ik := e.store.Encoder().IndexKey(sess.Namespace(), sess.Branch(), s.Table, s.Name, encTuple, pk)
 		e.txn.Buffer(txn, transactions.Mutation{Key: ik, Value: append([]byte(nil), pk...)})
 	}
 
@@ -141,15 +196,14 @@ func (e *execImpl) indexEntries(txn *transactions.Txn, sess *session.Session, sc
 	pk := primaryKeyBytes(sch, cells, rowKey)
 	enc := e.store.Encoder()
 	for _, d := range defs {
-		ci := sch.colIndex(d.Column)
-		if ci < 0 || cells[ci].Null {
-			continue
-		}
-		encVal, err := orderEncode(sch.Cols[ci].TypeOID, cells[ci].Text)
+		encTuple, ok, err := encodeIndexTuple(sch, d.Columns, cells)
 		if err != nil {
 			return err
 		}
-		ik := enc.IndexKey(sess.Namespace(), sess.Branch(), d.Table, d.Column, encVal, pk)
+		if !ok {
+			continue // a NULL indexed column: no entry
+		}
+		ik := enc.IndexKey(sess.Namespace(), sess.Branch(), d.Table, d.Name, encTuple, pk)
 		if add {
 			e.txn.Buffer(txn, transactions.Mutation{Key: ik, Value: append([]byte(nil), pk...)})
 		} else {

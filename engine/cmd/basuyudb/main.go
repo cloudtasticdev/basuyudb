@@ -30,6 +30,9 @@ func main() {
 	slog.SetDefault(logger)
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	// Offline admin subcommands (backup/restore) run and exit before the server.
+	maybeRunSubcommand(logger)
+
 	devMode := envBool("BASUYUDB_DEV_MODE", false)
 
 	logger.Info("BasuyuDB starting",
@@ -80,6 +83,9 @@ func main() {
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ctx) }()
+
+	// Optional OTel span retention sweeper (BASUYUDB_OTEL_RETENTION_HOURS).
+	startRetentionJob(ctx, exec, logger)
 
 	// OTLP gRPC ingestion (ADR-007; port 4317).
 	otlpAddr := envStr("BASUYUDB_OTLP_GRPC_ADDR", ":4317")
@@ -141,4 +147,16 @@ func envBool(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }

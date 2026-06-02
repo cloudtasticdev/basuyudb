@@ -133,7 +133,12 @@ func (e *engine) Get(ctx context.Context, txn *Txn, k storage.Key) ([]byte, erro
 // added when engine/internal/branch lands.)
 func (e *engine) NewIterator(txn *Txn, prefix storage.Key) storage.Iterator {
 	rtx := e.store.NewTransactionAt(txn.readUint)
-	return &snapshotIterator{Iterator: rtx.NewIterator(prefix), txn: rtx}
+	base := &snapshotIterator{Iterator: rtx.NewIterator(prefix), txn: rtx}
+	// Overlay the transaction's own buffered writes (read-your-writes for scans).
+	if buf := bufferedForPrefix(txn.mutations, prefix.Bytes()); len(buf) > 0 {
+		return &mergedIterator{store: base, buf: buf}
+	}
+	return base
 }
 
 // NewReverseIterator mirrors NewIterator but scans the prefix in descending key

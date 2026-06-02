@@ -133,15 +133,14 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 		if !d.Unique {
 			continue
 		}
-		ci := sch.colIndex(d.Column)
-		if ci < 0 || cells[ci].Null {
-			continue
-		}
-		encVal, err := orderEncode(sch.Cols[ci].TypeOID, cells[ci].Text)
+		encTuple, ok, err := encodeIndexTuple(sch, d.Columns, cells)
 		if err != nil {
 			return nil, err
 		}
-		dup, err := e.indexHasOtherPK(ctx, txn, sess, d, encVal, primaryKeyBytes(sch, cells, rowKey))
+		if !ok {
+			continue // a NULL indexed column: UNIQUE treats NULLs as distinct
+		}
+		dup, err := e.indexHasOtherPK(ctx, txn, sess, d, encTuple, primaryKeyBytes(sch, cells, rowKey))
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +161,7 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 // indexHasOtherPK reports whether a unique index already maps encVal (the
 // memcomparable-encoded value) to a row other than pk (UNIQUE enforcement).
 func (e *execImpl) indexHasOtherPK(ctx context.Context, txn *transactions.Txn, sess *session.Session, d indexDef, encVal, pk []byte) (bool, error) {
-	prefix := e.store.Encoder().IndexValuePrefix(sess.Namespace(), sess.Branch(), d.Table, d.Column, encVal)
+	prefix := e.store.Encoder().IndexValuePrefix(sess.Namespace(), sess.Branch(), d.Table, d.Name, encVal)
 	it := e.txn.NewIterator(txn, prefix)
 	defer it.Close()
 	for it.Rewind(); it.Valid(); it.Next() {
@@ -248,20 +247,20 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 			}
 			cells[idx] = Datum{Null: v.null, Text: v.text}
 		}
-		// Enforce UNIQUE for changed indexed columns.
+		// Enforce UNIQUE for changed index tuples.
 		for _, d := range defs {
 			if !d.Unique {
 				continue
 			}
-			ci := sch.colIndex(d.Column)
-			if ci < 0 || cells[ci].Null || cells[ci].Text == oldCells[ci].Text {
-				continue
-			}
-			encVal, err := orderEncode(sch.Cols[ci].TypeOID, cells[ci].Text)
+			newTuple, ok, err := encodeIndexTuple(sch, d.Columns, cells)
 			if err != nil {
 				return nil, err
 			}
-			dup, err := e.indexHasOtherPK(ctx, txn, sess, d, encVal, primaryKeyBytes(sch, cells, r.key))
+			oldTuple, _, _ := encodeIndexTuple(sch, d.Columns, oldCells)
+			if !ok || bytesEqual(newTuple, oldTuple) {
+				continue // NULL column, or tuple unchanged
+			}
+			dup, err := e.indexHasOtherPK(ctx, txn, sess, d, newTuple, primaryKeyBytes(sch, cells, r.key))
 			if err != nil {
 				return nil, err
 			}

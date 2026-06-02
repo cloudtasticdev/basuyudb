@@ -78,6 +78,10 @@ type Executor interface {
 	BeginExplicit(ctx context.Context, sess *session.Session) (*transactions.Txn, error)
 	CommitExplicit(ctx context.Context, tx *transactions.Txn) error
 	RollbackExplicit(ctx context.Context, tx *transactions.Txn) error
+
+	// SweepOTelRetention deletes otel_spans older than cutoff (RFC3339), for a
+	// background retention job. Returns the number removed.
+	SweepOTelRetention(ctx context.Context, sess *session.Session, cutoff string) (int, error)
 }
 
 // New constructs the canonical executor over a managed Store and the

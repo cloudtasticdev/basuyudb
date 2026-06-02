@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -69,6 +71,11 @@ type Store interface {
 	// would read below the persisted commit timestamps and miss everything.
 	MaxVersion() uint64
 	Sync() error
+	// Backup streams a consistent BadgerDB backup of all committed data to w and
+	// returns the version backed up. Restore loads a backup stream into this
+	// (empty) store. They are the engine's point-in-time backup primitive.
+	Backup(w io.Writer) (uint64, error)
+	Restore(r io.Reader) error
 	// BadgerDB is the documented escape hatch returning the underlying *badger.DB
 	// as interface{}. It exists ONLY for HNSW (008) and FTS (009). (by design)
 	BadgerDB() interface{}
@@ -180,6 +187,82 @@ func (s *badgerStore) SetDiscardTs(ts uint64) { s.db.SetDiscardTs(ts) }
 func (s *badgerStore) MaxVersion() uint64 { return s.db.MaxVersion() }
 
 func (s *badgerStore) Sync() error { return s.db.Sync() }
+
+// Backup writes a managed-mode-safe backup to w: every live key/value at the
+// current max version, each as a length-prefixed chunk (4-byte big-endian
+// length + bytes), key then value. BadgerDB's own DB.Backup uses NewStream
+// which panics under managed transactions, so we stream the snapshot directly.
+func (s *badgerStore) Backup(w io.Writer) (uint64, error) {
+	ver := s.db.MaxVersion()
+	txn := s.db.NewTransactionAt(ver, false)
+	defer txn.Discard()
+	it := txn.NewIterator(badger.DefaultIteratorOptions)
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		item := it.Item()
+		k := item.KeyCopy(nil)
+		v, err := item.ValueCopy(nil)
+		if err != nil {
+			return 0, err
+		}
+		if err := writeChunk(w, k); err != nil {
+			return 0, err
+		}
+		if err := writeChunk(w, v); err != nil {
+			return 0, err
+		}
+	}
+	return ver, nil
+}
+
+// Restore loads a backup produced by Backup into this (empty) store, applying
+// all pairs at a single commit version.
+func (s *badgerStore) Restore(r io.Reader) error {
+	wb := s.db.NewWriteBatchAt(1)
+	for {
+		k, err := readChunk(r)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			wb.Cancel()
+			return err
+		}
+		v, err := readChunk(r)
+		if err != nil {
+			wb.Cancel()
+			return err
+		}
+		if err := wb.SetEntryAt(badger.NewEntry(k, v), 1); err != nil {
+			wb.Cancel()
+			return err
+		}
+	}
+	return wb.Flush()
+}
+
+func writeChunk(w io.Writer, b []byte) error {
+	var lp [4]byte
+	binary.BigEndian.PutUint32(lp[:], uint32(len(b)))
+	if _, err := w.Write(lp[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(b)
+	return err
+}
+
+func readChunk(r io.Reader) ([]byte, error) {
+	var lp [4]byte
+	if _, err := io.ReadFull(r, lp[:]); err != nil {
+		return nil, err // io.EOF at a clean boundary signals end
+	}
+	n := binary.BigEndian.Uint32(lp[:])
+	b := make([]byte, n)
+	if _, err := io.ReadFull(r, b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
 
 func (s *badgerStore) BadgerDB() interface{} { return s.db }
 
