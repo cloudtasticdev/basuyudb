@@ -28,7 +28,7 @@ func ns(t *testing.T) auth.NamespaceID {
 // edge (by design): the same path replicates across a quorum
 // in a multi-node cluster.
 func TestRaftProposeApplies(t *testing.T) {
-	store, err := storage.Open(storage.Options{DataDir: t.TempDir()})
+	store, err := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +20,7 @@ import (
 // by a temp managed store, and returns its address.
 func startTestServer(t *testing.T) string {
 	t.Helper()
-	st, err := storage.Open(storage.Options{DataDir: t.TempDir()})
+	st, err := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,6 +171,80 @@ func TestGate1EndToEnd(t *testing.T) {
 	if tag != "SELECT 1" {
 		t.Fatalf("want command tag \"SELECT 1\", got %q", tag)
 	}
+}
+
+// TestConcurrentConnections opens many simultaneous wire connections, each
+// running queries, to confirm the per-connection goroutine model + executor
+// hold up under concurrent load (the scenario the live psql stress test could
+// not isolate from Windows process-spawn overhead).
+func TestConcurrentConnections(t *testing.T) {
+	addr := startTestServer(t)
+
+	const conns = 16
+	errs := make(chan error, conns)
+	var wg sync.WaitGroup
+	for i := 0; i < conns; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errs <- fmt.Errorf("conn %d panicked: %v", i, r)
+				}
+			}()
+			cl := dialPGNoFatal(t, addr)
+			if cl == nil {
+				errs <- fmt.Errorf("conn %d failed to connect", i)
+				return
+			}
+			rows, _ := cl.simpleQuery(t, fmt.Sprintf("SELECT %d + 1", i))
+			if len(rows) != 1 || rows[0][0] == nil {
+				errs <- fmt.Errorf("conn %d bad result", i)
+				return
+			}
+			errs <- nil
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("DEADLOCK: concurrent connections did not complete within 30s")
+	}
+	for i := 0; i < conns; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent conn failure: %v", err)
+		}
+	}
+}
+
+// dialPGNoFatal is like dialPG but returns nil instead of t.Fatal on dial error
+// (safe to call from a goroutine).
+func dialPGNoFatal(t *testing.T, addr string) *pgClient {
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return nil
+	}
+	cl := &pgClient{c: c, r: bufio.NewReader(c)}
+	var body []byte
+	body = binary.BigEndian.AppendUint32(body, 196608)
+	for _, kv := range [][2]string{{"user", "dev"}, {"database", "tenant_a"}} {
+		body = append(body, kv[0]...)
+		body = append(body, 0)
+		body = append(body, kv[1]...)
+		body = append(body, 0)
+	}
+	body = append(body, 0)
+	var pkt []byte
+	pkt = binary.BigEndian.AppendUint32(pkt, uint32(len(body)+4))
+	pkt = append(pkt, body...)
+	if _, err := c.Write(pkt); err != nil {
+		return nil
+	}
+	cl.drainToReady(t)
+	return cl
 }
 
 // TestSimpleQueryVariety exercises expressions, SET interception, and an error.

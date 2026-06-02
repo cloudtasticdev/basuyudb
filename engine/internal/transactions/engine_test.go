@@ -22,7 +22,7 @@ func testSess(t *testing.T, ns string) auth.Session {
 
 func openStore(t *testing.T) storage.Store {
 	t.Helper()
-	st, err := storage.Open(storage.Options{DataDir: t.TempDir()})
+	st, err := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
 	if err != nil {
 		t.Fatal(err)
 	}

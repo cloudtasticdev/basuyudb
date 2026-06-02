@@ -55,6 +55,11 @@ type Store interface {
 	NewTransactionAt(readTs uint64) Txn
 	NewWriteBatchAt(commitTs uint64) WriteBatch
 	SetDiscardTs(ts uint64)
+	// MaxVersion returns the maximum committed managed-mode timestamp persisted
+	// in the store. On reopen it is the basis for resuming the timestamp oracle
+	// so reads see all previously committed data — without it a restarted oracle
+	// would read below the persisted commit timestamps and miss everything.
+	MaxVersion() uint64
 	Sync() error
 	// BadgerDB is the documented escape hatch returning the underlying *badger.DB
 	// as interface{}. It exists ONLY for HNSW (008) and FTS (009). (by design)
@@ -163,6 +168,8 @@ func (s *badgerStore) NewWriteBatchAt(commitTs uint64) WriteBatch {
 }
 
 func (s *badgerStore) SetDiscardTs(ts uint64) { s.db.SetDiscardTs(ts) }
+
+func (s *badgerStore) MaxVersion() uint64 { return s.db.MaxVersion() }
 
 func (s *badgerStore) Sync() error { return s.db.Sync() }
 
