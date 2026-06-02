@@ -56,6 +56,7 @@ type TransactionEngine interface {
 	Begin(ctx context.Context, sess auth.Session) (*Txn, error)
 	Get(ctx context.Context, txn *Txn, k storage.Key) ([]byte, error)
 	NewIterator(txn *Txn, prefix storage.Key) storage.Iterator
+	NewReverseIterator(txn *Txn, prefix storage.Key) storage.Iterator
 	Buffer(txn *Txn, m Mutation)
 	Commit(ctx context.Context, txn *Txn) error
 	Rollback(ctx context.Context, txn *Txn) error
@@ -133,6 +134,14 @@ func (e *engine) Get(ctx context.Context, txn *Txn, k storage.Key) ([]byte, erro
 func (e *engine) NewIterator(txn *Txn, prefix storage.Key) storage.Iterator {
 	rtx := e.store.NewTransactionAt(txn.readUint)
 	return &snapshotIterator{Iterator: rtx.NewIterator(prefix), txn: rtx}
+}
+
+// NewReverseIterator mirrors NewIterator but scans the prefix in descending key
+// order (ORDER BY ... DESC over an ordered index). Buffered writes are not
+// merged, identical to NewIterator.
+func (e *engine) NewReverseIterator(txn *Txn, prefix storage.Key) storage.Iterator {
+	rtx := e.store.NewTransactionAt(txn.readUint)
+	return &snapshotIterator{Iterator: rtx.NewReverseIterator(prefix), txn: rtx}
 }
 
 // snapshotIterator owns the read transaction for the iterator's lifetime.

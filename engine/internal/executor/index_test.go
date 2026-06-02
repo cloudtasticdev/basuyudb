@@ -132,5 +132,12 @@ func (e *execImpl) indexScanProbe(t *testing.T, sess *session.Session, sql strin
 		return nil, false, err
 	}
 	defer e.txn.Rollback(context.Background(), txn)
-	return e.tryIndexScan(context.Background(), txn, sess, sel, nil)
+	scan, err := e.planIndexScan(context.Background(), txn, sess, sel, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	if scan == nil {
+		return nil, false, nil
+	}
+	return scan.rows, true, nil
 }

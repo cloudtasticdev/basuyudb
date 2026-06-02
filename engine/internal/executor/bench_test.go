@@ -128,6 +128,37 @@ func TestScaleBenchmark(t *testing.T) {
 	t.Logf("LOOKUP  WHERE id=X (PK point-get, table=%d rows)  p50=%v  p99=%v",
 		nRows, pctl(plat, 0.50).Round(time.Microsecond), pctl(plat, 0.99).Round(time.Microsecond))
 
+	// --- indexed range scan (WHERE amount BETWEEN-equivalent) vs full scan ---
+	// Build a secondary index on amount, then time a narrow range query. Without
+	// the index this is a full 100k-row scan; with it, a bounded index range.
+	mustExec("CREATE INDEX idx_amount ON bench (amount)")
+	var rlat []time.Duration
+	for r := 0; r < 30; r++ {
+		lo := (r * 131) % 99000
+		stmt, _ := parser.Parse(fmt.Sprintf("SELECT id FROM bench WHERE amount >= %d AND amount <= %d", lo, lo+50))
+		s := time.Now()
+		if _, err := ex.Execute(ctx, stmt, sess, nil); err != nil {
+			t.Fatal(err)
+		}
+		rlat = append(rlat, time.Since(s))
+	}
+	t.Logf("RANGE   WHERE amount in [x,x+50] (indexed, table=%d rows)  p50=%v  p99=%v",
+		nRows, pctl(rlat, 0.50).Round(time.Microsecond), pctl(rlat, 0.99).Round(time.Microsecond))
+
+	// ORDER BY amount DESC LIMIT 10 served by the index (no full sort).
+	var olat []time.Duration
+	for r := 0; r < 30; r++ {
+		stmt, _ := parser.Parse("SELECT id FROM bench ORDER BY amount DESC LIMIT 10")
+		s := time.Now()
+		rr, err := ex.Execute(ctx, stmt, sess, nil)
+		if err != nil || len(rr.Rows) != 10 {
+			t.Fatalf("order-by-limit failed: rows=%d err=%v", len(rr.Rows), err)
+		}
+		olat = append(olat, time.Since(s))
+	}
+	t.Logf("TOPN    ORDER BY amount DESC LIMIT 10 (indexed, table=%d rows)  p50=%v  p99=%v",
+		nRows, pctl(olat, 0.50).Round(time.Microsecond), pctl(olat, 0.99).Round(time.Microsecond))
+
 	// --- batched insert throughput (many rows, ONE transaction) ---
 	const batchN = 50_000
 	bt := time.Now()

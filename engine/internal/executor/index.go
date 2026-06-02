@@ -109,7 +109,11 @@ func (e *execImpl) execCreateIndex(ctx context.Context, s *ast.IndexStmt, sess *
 			seen[val.Text] = true
 		}
 		pk := primaryKeyBytes(sch, r.cells, r.key)
-		ik := e.store.Encoder().IndexKey(sess.Namespace(), sess.Branch(), s.Table, col, []byte(val.Text), pk)
+		encVal, err := orderEncode(sch.Cols[colIdx].TypeOID, val.Text)
+		if err != nil {
+			return nil, err
+		}
+		ik := e.store.Encoder().IndexKey(sess.Namespace(), sess.Branch(), s.Table, col, encVal, pk)
 		// The entry value carries the row's pk so an index scan fetches the row
 		// with a single point-get (no key parsing).
 		e.txn.Buffer(txn, transactions.Mutation{Key: ik, Value: append([]byte(nil), pk...)})
@@ -131,8 +135,9 @@ func primaryKeyBytes(sch *tableSchema, cells []Datum, rowKey storage.Key) []byte
 }
 
 // indexEntries writes (add=true) or deletes (add=false) the index entries for a
-// row across all of a table's indexes, within an open transaction.
-func (e *execImpl) indexEntries(txn *transactions.Txn, sess *session.Session, sch *tableSchema, defs []indexDef, cells []Datum, rowKey storage.Key, add bool) {
+// row across all of a table's indexes, within an open transaction. Values are
+// memcomparable-encoded per the indexed column's type (ADR-022).
+func (e *execImpl) indexEntries(txn *transactions.Txn, sess *session.Session, sch *tableSchema, defs []indexDef, cells []Datum, rowKey storage.Key, add bool) error {
 	pk := primaryKeyBytes(sch, cells, rowKey)
 	enc := e.store.Encoder()
 	for _, d := range defs {
@@ -140,11 +145,16 @@ func (e *execImpl) indexEntries(txn *transactions.Txn, sess *session.Session, sc
 		if ci < 0 || cells[ci].Null {
 			continue
 		}
-		ik := enc.IndexKey(sess.Namespace(), sess.Branch(), d.Table, d.Column, []byte(cells[ci].Text), pk)
+		encVal, err := orderEncode(sch.Cols[ci].TypeOID, cells[ci].Text)
+		if err != nil {
+			return err
+		}
+		ik := enc.IndexKey(sess.Namespace(), sess.Branch(), d.Table, d.Column, encVal, pk)
 		if add {
 			e.txn.Buffer(txn, transactions.Mutation{Key: ik, Value: append([]byte(nil), pk...)})
 		} else {
 			e.txn.Buffer(txn, transactions.Mutation{Key: ik, Delete: true})
 		}
 	}
+	return nil
 }

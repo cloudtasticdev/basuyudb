@@ -24,6 +24,10 @@ type Txn interface {
 	Set(k Key, val []byte) error
 	Delete(k Key) error
 	NewIterator(prefix Key) Iterator
+	// NewReverseIterator scans keys under prefix in descending order. Rewind
+	// positions at the largest key carrying the prefix; Next moves to smaller
+	// keys. Used for ORDER BY ... DESC over an ordered index.
+	NewReverseIterator(prefix Key) Iterator
 	Discard()
 	// CommitAt commits all writes at commitTs (managed mode). Read-only txns
 	// must call Discard instead.
@@ -33,6 +37,10 @@ type Txn interface {
 // Iterator scans keys in a managed-mode transaction.
 type Iterator interface {
 	Rewind()
+	// Seek positions the iterator at k (forward: first key >= k; reverse: first
+	// key <= k), bounded by the iterator's prefix. Used to start a range scan at
+	// a computed lower/upper bound.
+	Seek(k Key)
 	Valid() bool
 	Next()
 	Key() Key
@@ -243,12 +251,32 @@ func (t *badgerTxn) NewIterator(prefix Key) Iterator {
 	return &badgerIterator{it: it, prefix: prefix.Bytes()}
 }
 
+func (t *badgerTxn) NewReverseIterator(prefix Key) Iterator {
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false
+	opts.Reverse = true
+	it := t.txn.NewIterator(opts)
+	return &badgerIterator{it: it, prefix: prefix.Bytes(), reverse: true}
+}
+
 type badgerIterator struct {
 	it *badger.Iterator
 	prefix []byte
+	reverse bool
 }
 
-func (i *badgerIterator) Rewind() { i.it.Seek(i.prefix) }
+// Rewind positions at the start of the scan: the smallest key with the prefix
+// (forward), or the largest (reverse). For reverse, seek to the prefix's
+// successor — Badger then lands on the next-smaller key, i.e. the largest key
+// still carrying the prefix.
+func (i *badgerIterator) Rewind() {
+	if i.reverse {
+		i.it.Seek(prefixSuccessor(i.prefix))
+		return
+	}
+	i.it.Seek(i.prefix)
+}
+func (i *badgerIterator) Seek(k Key) { i.it.Seek(k.Bytes()) }
 func (i *badgerIterator) Valid() bool { return i.it.ValidForPrefix(i.prefix) }
 func (i *badgerIterator) Next() { i.it.Next() }
 func (i *badgerIterator) Key() Key { return rawKey(i.it.Item().KeyCopy(nil)) }
@@ -256,6 +284,21 @@ func (i *badgerIterator) Value() ([]byte, error) {
 	return i.it.Item().ValueCopy(nil)
 }
 func (i *badgerIterator) Close() { i.it.Close() }
+
+// prefixSuccessor returns the smallest byte string strictly greater than every
+// string having prefix p — p with its last non-0xFF byte incremented and the
+// trailing 0xFF bytes dropped. Returns nil if p is all 0xFF (no successor).
+func prefixSuccessor(p []byte) []byte {
+	out := append([]byte(nil), p...)
+	for len(out) > 0 {
+		if out[len(out)-1] != 0xFF {
+			out[len(out)-1]++
+			return out
+		}
+		out = out[:len(out)-1]
+	}
+	return nil
+}
 
 type badgerWriteBatch struct {
 	wb *badger.WriteBatch

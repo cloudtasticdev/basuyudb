@@ -34,6 +34,10 @@ func (k Key) Bytes() []byte { return k.b }
 // only KeyEncoder methods (and badger read-back into Key) may produce a Key.
 func rawKey(b []byte) Key { return Key{b: b} }
 
+// RawKey wraps already-encoded key bytes as a Key (e.g. a computed range bound
+// or a prefix built from KeyEncoder output). Callers must not mutate b after.
+func RawKey(b []byte) Key { return Key{b: b} }
+
 // IntentSuffix is the co-located Percolator intent discriminator.
 type IntentSuffix byte
 
@@ -51,6 +55,7 @@ type KeyEncoder interface {
 	RowPrefix(ns auth.NamespaceID, branch, table string) Key
 	IndexKey(ns auth.NamespaceID, branch, table, col string, val, pk []byte) Key
 	IndexValuePrefix(ns auth.NamespaceID, branch, table, col string, val []byte) Key
+	IndexColumnPrefix(ns auth.NamespaceID, branch, table, col string) Key
 	FTSKey(ns auth.NamespaceID, branch, table, field, term string, docID []byte) Key
 	VectorKey(ns auth.NamespaceID, branch, table, col string, id []byte) Key
 	OtelSpanKey(ns auth.NamespaceID, branch string, traceID, spanID []byte) Key
@@ -129,28 +134,38 @@ func (e keyEncoder) RowKey(ns auth.NamespaceID, branch, table string, pk []byte)
 	return rawKey(b)
 }
 
-func (keyEncoder) IndexKey(ns auth.NamespaceID, branch, table, col string, val, pk []byte) Key {
-	// /ns/{ns}/{main|br/branch}/idx/{table}/{col}/<lp:val>/<lp:pk>
+// IndexColumnPrefix returns the prefix shared by every entry of one indexed
+// column: /ns/{ns}/{branch}/idx/{table}/{col}/ (trailing separator so column
+// "a" does not prefix-match column "ab"). A scan over it yields the column's
+// entries in value order (ADR-022). val is the memcomparable-encoded value
+// (executor.orderEncode), appended raw so byte order equals logical order.
+func (keyEncoder) IndexColumnPrefix(ns auth.NamespaceID, branch, table, col string) Key {
 	b := nsRoot(ns)
 	b = append(b, branchSegment(branch)...)
 	b = appendStr(b, "idx")
 	b = appendStr(b, table)
 	b = appendStr(b, col)
-	b = appendBin(b, val)
+	b = append(b, '/')
+	return rawKey(b)
+}
+
+func (e keyEncoder) IndexKey(ns auth.NamespaceID, branch, table, col string, val, pk []byte) Key {
+	// /ns/{ns}/{main|br/branch}/idx/{table}/{col}/<memcmp:val>/<lp:pk>
+	// val is appended raw (it is already order-preserving and self-delimiting);
+	// pk is length-prefixed as a tiebreaker for equal values.
+	b := e.IndexColumnPrefix(ns, branch, table, col).Bytes()
+	b = append(b, val...)
 	b = appendBin(b, pk)
 	return rawKey(b)
 }
 
-// IndexValuePrefix returns the structural prefix matching every index entry for
-// a given (table, col, val): /ns/{ns}/{branch}/idx/{table}/{col}/<lp:val>. A
-// prefix scan over it yields all rows whose indexed column equals val.
-func (keyEncoder) IndexValuePrefix(ns auth.NamespaceID, branch, table, col string, val []byte) Key {
-	b := nsRoot(ns)
-	b = append(b, branchSegment(branch)...)
-	b = appendStr(b, "idx")
-	b = appendStr(b, table)
-	b = appendStr(b, col)
-	b = appendBin(b, val)
+// IndexValuePrefix returns the prefix matching every entry whose indexed value
+// equals val (the memcomparable encoding): the column prefix followed by the
+// raw encoded value. Used for equality lookups; the encoding is prefix-free so
+// it never matches a different value.
+func (e keyEncoder) IndexValuePrefix(ns auth.NamespaceID, branch, table, col string, val []byte) Key {
+	b := e.IndexColumnPrefix(ns, branch, table, col).Bytes()
+	b = append(b, val...)
 	return rawKey(b)
 }
 

@@ -137,7 +137,11 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 		if ci < 0 || cells[ci].Null {
 			continue
 		}
-		dup, err := e.indexHasOtherPK(ctx, txn, sess, d, cells[ci].Text, primaryKeyBytes(sch, cells, rowKey))
+		encVal, err := orderEncode(sch.Cols[ci].TypeOID, cells[ci].Text)
+		if err != nil {
+			return nil, err
+		}
+		dup, err := e.indexHasOtherPK(ctx, txn, sess, d, encVal, primaryKeyBytes(sch, cells, rowKey))
 		if err != nil {
 			return nil, err
 		}
@@ -146,17 +150,19 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 		}
 	}
 	e.txn.Buffer(txn, transactions.Mutation{Key: rowKey, Value: encodeRow(cells)})
-	e.indexEntries(txn, sess, sch, defs, cells, rowKey, true)
+	if err := e.indexEntries(txn, sess, sch, defs, cells, rowKey, true); err != nil {
+		return nil, err
+	}
 	if err := e.txn.Commit(ctx, txn); err != nil {
 		return nil, err
 	}
 	return &Result{Command: "INSERT", RowsAffected: 1}, nil
 }
 
-// indexHasOtherPK reports whether a unique index already maps value to a row
-// other than pk (used to enforce UNIQUE on insert/update).
-func (e *execImpl) indexHasOtherPK(ctx context.Context, txn *transactions.Txn, sess *session.Session, d indexDef, val string, pk []byte) (bool, error) {
-	prefix := e.store.Encoder().IndexValuePrefix(sess.Namespace(), sess.Branch(), d.Table, d.Column, []byte(val))
+// indexHasOtherPK reports whether a unique index already maps encVal (the
+// memcomparable-encoded value) to a row other than pk (UNIQUE enforcement).
+func (e *execImpl) indexHasOtherPK(ctx context.Context, txn *transactions.Txn, sess *session.Session, d indexDef, encVal, pk []byte) (bool, error) {
+	prefix := e.store.Encoder().IndexValuePrefix(sess.Namespace(), sess.Branch(), d.Table, d.Column, encVal)
 	it := e.txn.NewIterator(txn, prefix)
 	defer it.Close()
 	for it.Rewind(); it.Valid(); it.Next() {
@@ -251,7 +257,11 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 			if ci < 0 || cells[ci].Null || cells[ci].Text == oldCells[ci].Text {
 				continue
 			}
-			dup, err := e.indexHasOtherPK(ctx, txn, sess, d, cells[ci].Text, primaryKeyBytes(sch, cells, r.key))
+			encVal, err := orderEncode(sch.Cols[ci].TypeOID, cells[ci].Text)
+			if err != nil {
+				return nil, err
+			}
+			dup, err := e.indexHasOtherPK(ctx, txn, sess, d, encVal, primaryKeyBytes(sch, cells, r.key))
 			if err != nil {
 				return nil, err
 			}
@@ -260,9 +270,13 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 			}
 		}
 		bk := e.branchRowKey(sess, table, sch, cells, r.key)
-		e.indexEntries(txn, sess, sch, defs, oldCells, r.key, false)
+		if err := e.indexEntries(txn, sess, sch, defs, oldCells, r.key, false); err != nil {
+			return nil, err
+		}
 		e.txn.Buffer(txn, transactions.Mutation{Key: bk, Value: encodeRow(cells)})
-		e.indexEntries(txn, sess, sch, defs, cells, r.key, true)
+		if err := e.indexEntries(txn, sess, sch, defs, cells, r.key, true); err != nil {
+			return nil, err
+		}
 		count++
 	}
 	if err := e.txn.Commit(ctx, txn); err != nil {
@@ -312,7 +326,9 @@ func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *sess
 		} else {
 			e.txn.Buffer(txn, transactions.Mutation{Key: bk, Delete: true})
 		}
-		e.indexEntries(txn, sess, sch, defs, r.cells, r.key, false)
+		if err := e.indexEntries(txn, sess, sch, defs, r.cells, r.key, false); err != nil {
+			return nil, err
+		}
 		count++
 	}
 	if err := e.txn.Commit(ctx, txn); err != nil {
