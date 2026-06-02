@@ -4,7 +4,7 @@
 # no libc, minimal attack surface).
 
 # ---- build stage ----
-FROM golang:1.24 AS build
+FROM golang:1.26 AS build
 WORKDIR /src
 
 # Module graph first for layer caching. third_party holds the local renameio
@@ -16,7 +16,9 @@ RUN go mod download
 COPY . .
 
 # Static, stripped build. CGO disabled (ADR-002). SOURCE_DATE_EPOCH pins time.
-ARG VERSION=0.1.0
+# (Version is sourced from internal/version at compile time; this ARG is
+# informational only.)
+ARG VERSION=0.3.0
 ENV SOURCE_DATE_EPOCH=0
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath \
