@@ -3,6 +3,7 @@ package wire
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/auth"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/executor"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/parser"
@@ -238,6 +241,17 @@ func (c *conn) handleSimpleQuery(body []byte) {
 		c.sendExecError(&executor.ExecError{SQLSTATE: "25P02", Msg: "current transaction is aborted, commands ignored until end of transaction block"})
 		c.endQuery()
 		return
+	}
+
+	// COPY drives its own sub-protocol (CopyIn/CopyOut), so intercept it here.
+	if strings.HasPrefix(strings.ToUpper(trimmed), "COPY") {
+		if stmt, perr := parser.Parse(trimmed); perr == nil {
+			if cp, ok := stmt.(*ast.CopyStmt); ok {
+				c.handleCopy(cp)
+				c.endQuery()
+				return
+			}
+		}
 	}
 
 	res, err := c.execSQL(trimmed, nil)
@@ -506,14 +520,90 @@ func encodeBinary(text string, oid uint32) []byte {
 		var b [8]byte
 		binary.BigEndian.PutUint64(b[:], math.Float64bits(f))
 		return b[:]
+	case executor.OIDInt2:
+		n, _ := strconv.ParseInt(text, 10, 64)
+		var b [2]byte
+		binary.BigEndian.PutUint16(b[:], uint16(int16(n)))
+		return b[:]
 	case executor.OIDBool:
 		if text == "t" || text == "true" || text == "1" {
 			return []byte{1}
 		}
 		return []byte{0}
+	case executor.OIDUUID:
+		if u, ok := encodeUUID(text); ok {
+			return u
+		}
+		return []byte(text)
+	case executor.OIDDate:
+		if d, ok := encodeDate(text); ok {
+			return d
+		}
+		return []byte(text)
+	case executor.OIDTimestamp, executor.OIDTimestamptz:
+		if ts, ok := encodeTimestamp(text); ok {
+			return ts
+		}
+		return []byte(text)
 	default:
+		// text/varchar/char/json/jsonb/numeric/bytea: binary == UTF-8 bytes.
 		return []byte(text)
 	}
+}
+
+// pgEpoch is PostgreSQL's date/timestamp origin: 2000-01-01 00:00:00 UTC.
+var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+var tsLayouts = []string{
+	time.RFC3339Nano, time.RFC3339,
+	"2006-01-02 15:04:05.999999999", "2006-01-02 15:04:05", "2006-01-02",
+}
+
+func parseTime(text string) (time.Time, bool) {
+	for _, l := range tsLayouts {
+		if t, err := time.Parse(l, strings.TrimSpace(text)); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// encodeTimestamp produces the PG binary timestamp: int64 microseconds since
+// the PG epoch.
+func encodeTimestamp(text string) ([]byte, bool) {
+	t, ok := parseTime(text)
+	if !ok {
+		return nil, false
+	}
+	micros := t.UTC().Sub(pgEpoch).Microseconds()
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(micros))
+	return b[:], true
+}
+
+// encodeDate produces the PG binary date: int32 days since the PG epoch.
+func encodeDate(text string) ([]byte, bool) {
+	t, ok := parseTime(text)
+	if !ok {
+		return nil, false
+	}
+	days := int32(t.UTC().Sub(pgEpoch).Hours() / 24)
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(days))
+	return b[:], true
+}
+
+// encodeUUID produces the 16-byte PG binary UUID from its text form.
+func encodeUUID(text string) ([]byte, bool) {
+	hexStr := strings.ReplaceAll(strings.TrimSpace(text), "-", "")
+	if len(hexStr) != 32 {
+		return nil, false
+	}
+	b, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
 }
 
 func typeLen(oid uint32) int16 {

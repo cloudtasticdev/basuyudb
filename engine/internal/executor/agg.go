@@ -29,7 +29,8 @@ func containsAggregate(n ast.Node) bool {
 	found := false
 	_ = ast.Walk(n, func(node ast.Node) error {
 		if fc, ok := node.(*ast.FuncCall); ok {
-			if isAggregateName(strings.ToLower(strings.Join(fc.FuncName, "."))) {
+			// A windowed aggregate (f(...) OVER (...)) is not a grouping aggregate.
+			if fc.Over == nil && isAggregateName(strings.ToLower(strings.Join(fc.FuncName, "."))) {
 				found = true
 			}
 		}
@@ -270,6 +271,31 @@ func (e *execImpl) execAggregate(ctx context.Context, sess *session.Session, s *
 			}
 			return false
 		})
+	}
+
+	// DISTINCT over aggregated output: dedup projected rows before LIMIT.
+	if s.Distinct {
+		seen := make(map[string]bool, len(out))
+		kept := out[:0:0]
+		for _, o := range out {
+			var b strings.Builder
+			for _, d := range o.cells {
+				if d.Null {
+					b.WriteString("\x00N|")
+				} else {
+					b.WriteByte(1)
+					b.WriteString(d.Text)
+					b.WriteByte('|')
+				}
+			}
+			k := b.String()
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			kept = append(kept, o)
+		}
+		out = kept
 	}
 
 	// LIMIT.

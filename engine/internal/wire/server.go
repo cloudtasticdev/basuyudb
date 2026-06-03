@@ -220,16 +220,14 @@ func (c *conn) handleDescribe(body []byte) {
 		}
 		return
 	}
-	// Portal describe: execute to learn the row shape.
-	res, err := c.execStatement(c.parsedSQL, c.boundParams)
-	if err != nil {
-		c.sendExecError(err)
-		return
-	}
-	if len(res.Columns) == 0 {
-		c.mw.send(msgNoData, nil)
+	// Portal describe: determine the row shape WITHOUT executing — executing here
+	// would run mutating statements (INSERT/UPDATE/DELETE ... RETURNING) an extra
+	// time before Execute. node-postgres (and other drivers) describe the portal
+	// after Bind, so this path must be side-effect-free.
+	if cols := c.describeColumns(); len(cols) > 0 {
+		c.mw.send(msgRowDescription, rowDescription(cols))
 	} else {
-		c.mw.send(msgRowDescription, rowDescription(res.Columns))
+		c.mw.send(msgNoData, nil)
 	}
 }
 
@@ -241,6 +239,11 @@ func (c *conn) describeColumns() []executor.Column {
 	stmt, err := parser.Parse(c.parsedSQL)
 	if err != nil {
 		return nil
+	}
+	// INSERT/UPDATE/DELETE ... RETURNING: resolve columns from the schema
+	// without executing (executing here would mutate rows).
+	if cols, ok, err := c.srv.exec.DescribeReturning(context.Background(), stmt, c.sess); err == nil && ok {
+		return cols
 	}
 	if _, ok := stmt.(*ast.SelectStmt); !ok {
 		return nil

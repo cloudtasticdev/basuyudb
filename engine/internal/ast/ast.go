@@ -41,6 +41,11 @@ const (
 	T_TruncateStmt
 	T_AlterTableStmt
 	T_List
+	T_CaseExpr
+	T_CaseWhen
+	T_CreateViewStmt
+	T_CopyStmt
+	T_SetToDefault
 )
 
 // Node is the single canonical AST interface. Every AST node implements it.
@@ -82,6 +87,7 @@ func TagOf(n Node) NodeTag {
 // shape required by the Gate-3 OTel JOIN demo. (by design)
 type SelectStmt struct {
 	WithClause *WithClause // optional CTEs
+	Distinct bool // SELECT DISTINCT
 	TargetList []*ResTarget
 	FromClause []Node // RangeVar | JoinExpr | SubLink (subquery in FROM)
 	WhereClause Node // boolean expression or nil
@@ -90,10 +96,38 @@ type SelectStmt struct {
 	SortClause []*SortBy
 	LimitCount Node // A_Const | ParamRef | nil
 	LimitOffset Node
+
+	// Set operation. When SetOp != SetOpNone, this node is a set-operation node:
+	// Larg/Rarg are the operands and the body fields above are empty except the
+	// trailing SortClause/LimitCount/LimitOffset, which apply to the whole result.
+	SetOp SetOpType
+	All bool // UNION ALL / INTERSECT ALL / EXCEPT ALL
+	Larg *SelectStmt
+	Rarg *SelectStmt
 }
+
+// SetOpType enumerates the SQL set operations.
+type SetOpType int32
+
+const (
+	SetOpNone SetOpType = iota
+	SetOpUnion
+	SetOpIntersect
+	SetOpExcept
+)
 
 func (*SelectStmt) nodeTag() NodeTag { return T_SelectStmt }
 func (s *SelectStmt) walkChildren(fn func(Node) error) error {
+	if s.Larg != nil {
+		if err := fn(s.Larg); err != nil {
+			return err
+		}
+	}
+	if s.Rarg != nil {
+		if err := fn(s.Rarg); err != nil {
+			return err
+		}
+	}
 	if s.WithClause != nil {
 		if err := fn(s.WithClause); err != nil {
 			return err
@@ -148,6 +182,16 @@ type InsertStmt struct {
 	Cols []*ResTarget
 	SelectStmt Node // VALUES list (SelectStmt with no FromClause) or subquery
 	ReturningList []*ResTarget
+	OnConflict *OnConflictClause // optional ON CONFLICT action
+}
+
+// OnConflictClause models INSERT ... ON CONFLICT [(cols)] DO NOTHING | DO UPDATE
+// SET .... DoUpdateSet assignments may reference EXCLUDED.<col> (the proposed
+// insert row).
+type OnConflictClause struct {
+	Columns []string // conflict target columns (informational; PK is matched)
+	DoNothing bool
+	DoUpdateSet []*ResTarget
 }
 
 func (*InsertStmt) nodeTag() NodeTag { return T_InsertStmt }
@@ -433,6 +477,13 @@ type FuncCall struct {
 	FuncName []string // qualified name parts, e.g. ["fts_match"]
 	Args []Node
 	AggStar bool // COUNT(*)
+	Over *WindowDef // non-nil when called as a window function: f(...) OVER (...)
+}
+
+// WindowDef is the OVER (...) specification of a window function call.
+type WindowDef struct {
+	PartitionBy []Node
+	OrderBy []*SortBy
 }
 
 func (*FuncCall) nodeTag() NodeTag { return T_FuncCall }
@@ -611,7 +662,146 @@ type ColumnDef struct {
 	TypeName string
 	NotNull bool
 	PrimaryKey bool
+	Unique bool  // inline UNIQUE column constraint
 	Default Node // optional default expression
+	Check Node   // optional CHECK (expr) constraint
+	FKTable string  // REFERENCES target table (empty if no FK)
+	FKColumn string // REFERENCES target column (empty -> parent PK)
+}
+
+// CaseExpr is a CASE expression. Arg is non-nil for the simple form
+// (CASE x WHEN v THEN ...), nil for the searched form (CASE WHEN cond THEN ...).
+// Else is optional (NULL when absent).
+type CaseExpr struct {
+	Arg   Node
+	Whens []*CaseWhen
+	Else  Node
+}
+
+func (*CaseExpr) nodeTag() NodeTag { return T_CaseExpr }
+func (c *CaseExpr) walkChildren(fn func(Node) error) error {
+	if c.Arg != nil {
+		if err := fn(c.Arg); err != nil {
+			return err
+		}
+	}
+	for _, w := range c.Whens {
+		if err := fn(w); err != nil {
+			return err
+		}
+	}
+	if c.Else != nil {
+		return fn(c.Else)
+	}
+	return nil
+}
+
+// CaseWhen is one WHEN arm of a CASE. For a searched CASE, Cond is a boolean
+// predicate; for a simple CASE, Cond is the value compared against CaseExpr.Arg.
+type CaseWhen struct {
+	Cond   Node
+	Result Node
+}
+
+func (*CaseWhen) nodeTag() NodeTag { return T_CaseWhen }
+func (w *CaseWhen) walkChildren(fn func(Node) error) error {
+	if err := fn(w.Cond); err != nil {
+		return err
+	}
+	return fn(w.Result)
+}
+
+// ColQualKind enumerates the inline column constraints (NOT NULL, DEFAULT, ...)
+// that may follow a column's type in any order in a CREATE TABLE.
+type ColQualKind int
+
+const (
+	ColQualNotNull ColQualKind = iota
+	ColQualNull
+	ColQualPrimaryKey
+	ColQualUnique
+	ColQualDefault
+	ColQualReferences // FOREIGN KEY: REFERENCES table[(col)]
+	ColQualCheck      // CHECK (expr)
+)
+
+// ColQual is one inline column constraint. Expr is set for ColQualDefault and
+// ColQualCheck; RefTable/RefCol for ColQualReferences.
+type ColQual struct {
+	Kind ColQualKind
+	Expr Node
+	RefTable string
+	RefCol string
+}
+
+// NewColumnDef folds an ordered list of inline qualifiers onto a base column
+// definition, so the grammar can accept constraints in any order.
+func NewColumnDef(name, typeName string, quals []ColQual) ColumnDef {
+	cd := ColumnDef{ColName: name, TypeName: typeName}
+	for _, q := range quals {
+		switch q.Kind {
+		case ColQualNotNull:
+			cd.NotNull = true
+		case ColQualNull:
+			cd.NotNull = false
+		case ColQualPrimaryKey:
+			cd.PrimaryKey = true
+			cd.NotNull = true
+		case ColQualUnique:
+			cd.Unique = true
+		case ColQualDefault:
+			cd.Default = q.Expr
+		case ColQualReferences:
+			cd.FKTable = q.RefTable
+			cd.FKColumn = q.RefCol
+		case ColQualCheck:
+			cd.Check = q.Expr
+		}
+	}
+	return cd
+}
+
+// CreateViewStmt — CREATE [OR REPLACE] VIEW name AS query.
+type CreateViewStmt struct {
+	Relation *RangeVar
+	Query    Node // SelectStmt
+	Replace  bool
+}
+
+func (*CreateViewStmt) nodeTag() NodeTag { return T_CreateViewStmt }
+func (s *CreateViewStmt) walkChildren(fn func(Node) error) error {
+	if s.Query != nil {
+		return fn(s.Query)
+	}
+	return nil
+}
+
+// SetToDefault is the DEFAULT keyword used as a value in an INSERT VALUES list
+// (ORMs like Drizzle emit it for serial/defaulted columns). It instructs the
+// executor to apply the column's default rather than an explicit value.
+type SetToDefault struct{}
+
+func (*SetToDefault) nodeTag() NodeTag                       { return T_SetToDefault }
+func (*SetToDefault) walkChildren(fn func(Node) error) error { return nil }
+
+// CopyStmt — COPY table [(cols)] FROM STDIN / TO STDOUT, or COPY (query) TO
+// STDOUT. IsFrom distinguishes load (FROM STDIN) from export (TO STDOUT).
+type CopyStmt struct {
+	Table     string
+	Columns   []string
+	Query     Node // SelectStmt for COPY (query) TO STDOUT; nil otherwise
+	IsFrom    bool
+	Format    string // "text" (default) or "csv"
+	Delimiter string // single-char delimiter; "" = format default
+	Header    bool   // CSV HEADER
+}
+
+func (*CopyStmt) nodeTag() NodeTag { return T_CopyStmt }
+func (s *CopyStmt) walkChildren(fn func(Node) error) error {
+	if s.Query != nil {
+		return fn(s.Query)
+	}
+	return nil
 }
 
 // IndexStmt — CREATE [UNIQUE] INDEX name ON table (col, ...).
@@ -629,6 +819,7 @@ func (*IndexStmt) walkChildren(fn func(Node) error) error { return nil }
 type DropStmt struct {
 	Table    string
 	IfExists bool
+	IsView   bool // DROP VIEW vs DROP TABLE
 }
 
 func (*DropStmt) nodeTag() NodeTag                       { return T_DropStmt }

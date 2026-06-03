@@ -27,6 +27,10 @@ const (
 	msgBindComplete = '2'
 	msgNoData = 'n'
 	msgParameterDesc = 't'
+	msgCopyInResponse = 'G'
+	msgCopyOutResponse = 'H'
+	msgCopyData = 'd'
+	msgCopyDone = 'c'
 )
 
 // Frontend message type bytes (client -> server).
@@ -40,6 +44,9 @@ const (
 	fMsgClose = 'C'
 	fMsgTerminate = 'X'
 	fMsgPassword = 'p'
+	fMsgCopyData = 'd'
+	fMsgCopyDone = 'c'
+	fMsgCopyFail = 'f'
 )
 
 // msgReader reads length-prefixed protocol messages.

@@ -19,8 +19,18 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 	strs []string
 	colDefs []ast.ColumnDef
 	colDef ast.ColumnDef
+	colQual ast.ColQual
+	colQuals []ast.ColQual
+	caseWhen *ast.CaseWhen
+	caseWhens []*ast.CaseWhen
+	withClause *ast.WithClause
+	cte *ast.CommonTableExpr
+	ctes []*ast.CommonTableExpr
+	windowDef *ast.WindowDef
+	copyStmt *ast.CopyStmt
 	jt ast.JoinType
 	boolVal bool
+	onConflict *ast.OnConflictClause
 }
 
 %token <str> IDENT SCONST ICONST FCONST OP COMPARE_OP ADD_OP MUL_OP JSON_OP VECTOR_OP STAR
@@ -30,14 +40,21 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %token INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE PRIMARY KEY
 %token INDEX UNIQUE
 %token BRANCH MERGE DROP TRUE FALSE DISTINCT TYPECAST
-%token ALTER TRUNCATE COLUMN ADD IF EXISTS IN
+%token ALTER TRUNCATE COLUMN ADD IF EXISTS IN RETURNING CONFLICT DO NOTHING DEFAULT
+%token CASE WHEN THEN ELSE END
+%token UNION INTERSECT EXCEPT ALL
+%token REFERENCES CHECK FOREIGN
+%token WITH OVER PARTITION VIEW REPLACE
+%token COPY TO STDIN STDOUT FORMAT DELIMITER HEADER
 
-%type <node> stmt select_stmt insert_stmt update_stmt delete_stmt create_stmt create_index_stmt
+%type <node> stmt select_stmt select_core insert_stmt update_stmt delete_stmt create_stmt create_index_stmt copy_stmt
 %type <node> drop_table_stmt truncate_stmt alter_table_stmt
 %type <node> create_branch_stmt merge_branch_stmt drop_branch_stmt
 %type <node> expr table_ref from_item where_opt having_opt limit_opt offset_opt
-%type <nodes> from_clause from_list expr_list group_opt
-%type <resTargets> target_list set_list
+%type <nodes> from_clause from_list expr_list group_opt insert_values
+%type <node> insert_value
+%type <resTargets> target_list set_list returning_opt
+%type <onConflict> on_conflict_opt
 %type <resTarget> target_el set_el
 %type <rangeVar> qualified_name
 %type <sortList> order_opt sort_list
@@ -45,9 +62,24 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %type <strs> name_list insert_cols_opt
 %type <colDefs> col_def_list
 %type <colDef> col_def
+%type <colQual> col_qual
+%type <colQuals> col_qual_list col_qual_list_opt
+%type <node> case_expr case_arg_opt case_else_opt
+%type <caseWhen> case_when
+%type <caseWhens> case_when_list
+%type <withClause> with_clause_opt
+%type <cte> common_table_expr
+%type <ctes> cte_list
+%type <windowDef> window_spec
+%type <nodes> partition_opt
+%type <copyStmt> copy_opts copy_opt_list copy_opt
+%type <strs> copy_cols_opt
+%type <str> typename type_words cast_type
 %type <jt> join_type
-%type <boolVal> distinct_opt
+%type <boolVal> distinct_opt set_all_opt
 
+%left UNION EXCEPT
+%left INTERSECT
 %left OR
 %left AND
 %right NOT
@@ -60,6 +92,10 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %left JSON_OP
 %right TYPECAST
 %right UMINUS
+/* COLDEFAULT (highest) forces `col DEFAULT <expr> NOT NULL` to reduce the
+   default expression when NOT is seen, treating NOT as a new column qualifier
+   rather than an `expr NOT IN` continuation. */
+%nonassoc COLDEFAULT
 
 %%
 
@@ -87,22 +123,72 @@ stmt:
 	| create_branch_stmt { $$ = $1 }
 	| merge_branch_stmt { $$ = $1 }
 	| drop_branch_stmt { $$ = $1 }
+	| copy_stmt { $$ = $1 }
 
 /* ----- SELECT ----- */
+/* select_stmt is a (possibly set-op) select_core with trailing ORDER BY / LIMIT
+   / OFFSET that apply to the whole result. */
 select_stmt:
-	SELECT distinct_opt target_list from_clause where_opt group_opt having_opt order_opt limit_opt offset_opt
+	with_clause_opt select_core order_opt limit_opt offset_opt
+		{
+			sel := $2.(*ast.SelectStmt)
+			sel.WithClause = $1
+			sel.SortClause = $3
+			sel.LimitCount = $4
+			sel.LimitOffset = $5
+			$$ = sel
+		}
+
+with_clause_opt:
+		{ $$ = nil }
+	| WITH cte_list
+		{ $$ = &ast.WithClause{CTEs: $2} }
+
+cte_list:
+	common_table_expr
+		{ $$ = []*ast.CommonTableExpr{$1} }
+	| cte_list ',' common_table_expr
+		{ $$ = append($1, $3) }
+
+common_table_expr:
+	IDENT AS '(' select_stmt ')'
+		{ $$ = &ast.CommonTableExpr{Name: $1, Query: $4} }
+
+/* OVER ( [PARTITION BY ...] [ORDER BY ...] ) */
+window_spec:
+	partition_opt order_opt
+		{ $$ = &ast.WindowDef{PartitionBy: $1, OrderBy: $2} }
+
+partition_opt:
+		{ $$ = nil }
+	| PARTITION BY expr_list
+		{ $$ = $3 }
+
+select_core:
+	SELECT distinct_opt target_list from_clause where_opt group_opt having_opt
 		{
 			$$ = &ast.SelectStmt{
+				Distinct: $2,
 				TargetList: $3,
 				FromClause: $4,
 				WhereClause: $5,
 				GroupClause: $6,
 				HavingClause: $7,
-				SortClause: $8,
-				LimitCount: $9,
-				LimitOffset: $10,
 			}
 		}
+	| select_core UNION set_all_opt select_core
+		{ $$ = &ast.SelectStmt{SetOp: ast.SetOpUnion, All: $3, Larg: $1.(*ast.SelectStmt), Rarg: $4.(*ast.SelectStmt)} }
+	| select_core INTERSECT set_all_opt select_core
+		{ $$ = &ast.SelectStmt{SetOp: ast.SetOpIntersect, All: $3, Larg: $1.(*ast.SelectStmt), Rarg: $4.(*ast.SelectStmt)} }
+	| select_core EXCEPT set_all_opt select_core
+		{ $$ = &ast.SelectStmt{SetOp: ast.SetOpExcept, All: $3, Larg: $1.(*ast.SelectStmt), Rarg: $4.(*ast.SelectStmt)} }
+
+set_all_opt:
+		{ $$ = false }
+	| ALL
+		{ $$ = true }
+	| DISTINCT
+		{ $$ = false }
 
 distinct_opt:
 		{ $$ = false }
@@ -211,7 +297,7 @@ offset_opt:
 
 /* ----- INSERT ----- */
 insert_stmt:
-	INSERT INTO qualified_name insert_cols_opt VALUES '(' expr_list ')'
+	INSERT INTO qualified_name insert_cols_opt VALUES '(' insert_values ')' on_conflict_opt returning_opt
 		{
 			cols := make([]*ast.ResTarget, 0, len($4))
 			for _, c := range $4 {
@@ -221,18 +307,48 @@ insert_stmt:
 				Relation: $3,
 				Cols: cols,
 				SelectStmt: &ast.SelectStmt{TargetList: valuesToTargets($7)},
+				OnConflict: $9,
+				ReturningList: $10,
 			}
 		}
+
+/* INSERT VALUES items: an expression, or the DEFAULT keyword (which ORMs emit
+   for serial/defaulted columns). */
+insert_values:
+	insert_value
+		{ $$ = []ast.Node{$1} }
+	| insert_values ',' insert_value
+		{ $$ = append($1, $3) }
+
+insert_value:
+	expr
+		{ $$ = $1 }
+	| DEFAULT
+		{ $$ = &ast.SetToDefault{} }
 
 insert_cols_opt:
 		{ $$ = nil }
 	| '(' name_list ')'
 		{ $$ = $2 }
 
+on_conflict_opt:
+		{ $$ = nil }
+	| ON CONFLICT DO NOTHING
+		{ $$ = &ast.OnConflictClause{DoNothing: true} }
+	| ON CONFLICT '(' name_list ')' DO NOTHING
+		{ $$ = &ast.OnConflictClause{Columns: $4, DoNothing: true} }
+	| ON CONFLICT '(' name_list ')' DO UPDATE SET set_list
+		{ $$ = &ast.OnConflictClause{Columns: $4, DoUpdateSet: $9} }
+
+returning_opt:
+		{ $$ = nil }
+	| RETURNING target_list
+		{ $$ = $2 }
+
 /* ----- UPDATE ----- */
 update_stmt:
-	UPDATE qualified_name SET set_list where_opt
-		{ $$ = &ast.UpdateStmt{Relation: $2, TargetList: $4, WhereClause: $5} }
+	UPDATE qualified_name SET set_list where_opt returning_opt
+		{ $$ = &ast.UpdateStmt{Relation: $2, TargetList: $4, WhereClause: $5, ReturningList: $6} }
 
 set_list:
 	set_el
@@ -249,13 +365,17 @@ set_el:
 
 /* ----- DELETE ----- */
 delete_stmt:
-	DELETE FROM qualified_name where_opt
-		{ $$ = &ast.DeleteStmt{Relation: $3, WhereClause: $4} }
+	DELETE FROM qualified_name where_opt returning_opt
+		{ $$ = &ast.DeleteStmt{Relation: $3, WhereClause: $4, ReturningList: $5} }
 
 /* ----- CREATE TABLE ----- */
 create_stmt:
 	CREATE TABLE qualified_name '(' col_def_list ')'
 		{ $$ = &ast.CreateStmt{Relation: $3, TableElts: $5} }
+	| CREATE VIEW qualified_name AS select_stmt
+		{ $$ = &ast.CreateViewStmt{Relation: $3, Query: $5} }
+	| CREATE OR REPLACE VIEW qualified_name AS select_stmt
+		{ $$ = &ast.CreateViewStmt{Relation: $5, Query: $7, Replace: true} }
 
 create_index_stmt:
 	CREATE INDEX IDENT ON qualified_name '(' name_list ')'
@@ -268,6 +388,48 @@ drop_table_stmt:
 		{ $$ = &ast.DropStmt{Table: $3.RelName} }
 	| DROP TABLE IF EXISTS qualified_name
 		{ $$ = &ast.DropStmt{Table: $5.RelName, IfExists: true} }
+	| DROP VIEW qualified_name
+		{ $$ = &ast.DropStmt{Table: $3.RelName, IsView: true} }
+	| DROP VIEW IF EXISTS qualified_name
+		{ $$ = &ast.DropStmt{Table: $5.RelName, IfExists: true, IsView: true} }
+
+/* COPY t [(cols)] FROM STDIN | TO STDOUT, or COPY (query) TO STDOUT. */
+copy_stmt:
+	COPY qualified_name copy_cols_opt FROM STDIN copy_opts
+		{ c := $6; c.Table = $2.RelName; c.Columns = $3; c.IsFrom = true; $$ = c }
+	| COPY qualified_name copy_cols_opt TO STDOUT copy_opts
+		{ c := $6; c.Table = $2.RelName; c.Columns = $3; $$ = c }
+	| COPY '(' select_stmt ')' TO STDOUT copy_opts
+		{ c := $7; c.Query = $3; $$ = c }
+
+copy_cols_opt:
+		{ $$ = nil }
+	| '(' name_list ')'
+		{ $$ = $2 }
+
+copy_opts:
+		{ $$ = &ast.CopyStmt{Format: "text"} }
+	| WITH '(' copy_opt_list ')'
+		{ c := $3; if c.Format == "" { c.Format = "text" }; $$ = c }
+
+copy_opt_list:
+	copy_opt
+		{ $$ = $1 }
+	| copy_opt_list ',' copy_opt
+		{
+			if $3.Format != "" { $1.Format = $3.Format }
+			if $3.Delimiter != "" { $1.Delimiter = $3.Delimiter }
+			if $3.Header { $1.Header = true }
+			$$ = $1
+		}
+
+copy_opt:
+	FORMAT IDENT
+		{ $$ = &ast.CopyStmt{Format: $2} }
+	| DELIMITER SCONST
+		{ $$ = &ast.CopyStmt{Delimiter: $2} }
+	| HEADER
+		{ $$ = &ast.CopyStmt{Header: true} }
 
 truncate_stmt:
 	TRUNCATE qualified_name
@@ -292,12 +454,68 @@ col_def_list:
 		{ $$ = append($1, $3) }
 
 col_def:
-	IDENT IDENT
-		{ $$ = ast.ColumnDef{ColName: $1, TypeName: $2} }
-	| IDENT IDENT NOT NULL
-		{ $$ = ast.ColumnDef{ColName: $1, TypeName: $2, NotNull: true} }
-	| IDENT IDENT PRIMARY KEY
-		{ $$ = ast.ColumnDef{ColName: $1, TypeName: $2, PrimaryKey: true, NotNull: true} }
+	IDENT typename col_qual_list_opt
+		{ $$ = ast.NewColumnDef($1, $2, $3) }
+
+col_qual_list_opt:
+		{ $$ = nil }
+	| col_qual_list
+		{ $$ = $1 }
+
+col_qual_list:
+	col_qual
+		{ $$ = []ast.ColQual{$1} }
+	| col_qual_list col_qual
+		{ $$ = append($1, $2) }
+
+col_qual:
+	NOT NULL
+		{ $$ = ast.ColQual{Kind: ast.ColQualNotNull} }
+	| NULL
+		{ $$ = ast.ColQual{Kind: ast.ColQualNull} }
+	| PRIMARY KEY
+		{ $$ = ast.ColQual{Kind: ast.ColQualPrimaryKey} }
+	| UNIQUE
+		{ $$ = ast.ColQual{Kind: ast.ColQualUnique} }
+	| DEFAULT expr %prec COLDEFAULT
+		{ $$ = ast.ColQual{Kind: ast.ColQualDefault, Expr: $2} }
+	| REFERENCES qualified_name
+		{ $$ = ast.ColQual{Kind: ast.ColQualReferences, RefTable: $2.RelName} }
+	| REFERENCES qualified_name '(' IDENT ')'
+		{ $$ = ast.ColQual{Kind: ast.ColQualReferences, RefTable: $2.RelName, RefCol: $4} }
+	| CHECK '(' expr ')'
+		{ $$ = ast.ColQual{Kind: ast.ColQualCheck, Expr: $3} }
+
+/* A SQL type name: one or more words (double precision, timestamp with time
+   zone), with an optional precision/length modifier (varchar(255),
+   numeric(10,2)). Only the base words drive the type OID; modifiers are parsed
+   and discarded. */
+typename:
+	type_words
+		{ $$ = $1 }
+	| type_words '(' ICONST ')'
+		{ $$ = $1 }
+	| type_words '(' ICONST ',' ICONST ')'
+		{ $$ = $1 }
+
+type_words:
+	IDENT
+		{ $$ = $1 }
+	| type_words IDENT
+		{ $$ = $1 + " " + $2 }
+	| type_words WITH
+		{ $$ = $1 + " with" } /* "timestamp with time zone" — WITH is a keyword */
+
+/* Cast target type: a single type word with an optional modifier. Multi-word
+   types (double precision, timestamp with time zone) use their one-word alias
+   in cast position (float8, timestamptz) to keep the grammar conflict-free. */
+cast_type:
+	IDENT
+		{ $$ = $1 }
+	| IDENT '(' ICONST ')'
+		{ $$ = $1 }
+	| IDENT '(' ICONST ',' ICONST ')'
+		{ $$ = $1 }
 
 /* ----- branch DDL ----- */
 create_branch_stmt:
@@ -346,8 +564,16 @@ expr:
 		{ $$ = &ast.FuncCall{FuncName: []string{$1}, AggStar: true} }
 	| IDENT '(' expr_list ')'
 		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3} }
+	| IDENT '(' ')' OVER '(' window_spec ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Over: $6} }
+	| IDENT '(' STAR ')' OVER '(' window_spec ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, AggStar: true, Over: $7} }
+	| IDENT '(' expr_list ')' OVER '(' window_spec ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3, Over: $7} }
 	| '(' expr ')'
 		{ $$ = $2 }
+	| case_expr
+		{ $$ = $1 }
 	| '(' select_stmt ')'
 		{ $$ = &ast.SubLink{SubSelect: $2} }
 	| expr IN '(' select_stmt ')'
@@ -380,10 +606,36 @@ expr:
 		{ $$ = &ast.NullTest{Arg: $1, TestNull: true} }
 	| expr IS NOT NULL
 		{ $$ = &ast.NullTest{Arg: $1, TestNull: false} }
-	| expr TYPECAST IDENT
+	| expr TYPECAST cast_type
 		{ $$ = &ast.TypeCast{Arg: $1, TypeName: $3} }
 	| ADD_OP expr %prec UMINUS
 		{ $$ = &ast.A_Expr{Kind: ast.AEXPR_OP, Name: $1, Rexpr: $2} }
+
+/* CASE — both the searched form (CASE WHEN cond THEN r ...) and the simple form
+   (CASE arg WHEN val THEN r ...). case_arg_opt distinguishes them. */
+case_expr:
+	CASE case_arg_opt case_when_list case_else_opt END
+		{ $$ = &ast.CaseExpr{Arg: $2, Whens: $3, Else: $4} }
+
+case_arg_opt:
+		{ $$ = nil }
+	| expr
+		{ $$ = $1 }
+
+case_when_list:
+	case_when
+		{ $$ = []*ast.CaseWhen{$1} }
+	| case_when_list case_when
+		{ $$ = append($1, $2) }
+
+case_when:
+	WHEN expr THEN expr
+		{ $$ = &ast.CaseWhen{Cond: $2, Result: $4} }
+
+case_else_opt:
+		{ $$ = nil }
+	| ELSE expr
+		{ $$ = $2 }
 
 qualified_name:
 	IDENT

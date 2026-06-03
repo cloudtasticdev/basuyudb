@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/auth"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/session"
@@ -59,8 +60,16 @@ func (e *execImpl) BeginExplicit(ctx context.Context, sess *session.Session) (*t
 }
 
 // CommitExplicit commits a multi-statement transaction (the wire layer's COMMIT).
+// A write-write conflict surfaces as SQLSTATE 40001 so the client retries the
+// whole transaction (first-committer-wins snapshot isolation).
 func (e *execImpl) CommitExplicit(ctx context.Context, tx *transactions.Txn) error {
-	return e.txn.Commit(ctx, tx)
+	if err := e.txn.Commit(ctx, tx); err != nil {
+		if errors.Is(err, transactions.ErrWriteConflict) {
+			return newExecError("40001", "could not serialize access due to concurrent update")
+		}
+		return err
+	}
+	return nil
 }
 
 // RollbackExplicit rolls back a multi-statement transaction (ROLLBACK).

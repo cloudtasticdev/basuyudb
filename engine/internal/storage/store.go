@@ -70,6 +70,10 @@ type Store interface {
 	// so reads see all previously committed data — without it a restarted oracle
 	// would read below the persisted commit timestamps and miss everything.
 	MaxVersion() uint64
+	// LatestVersion returns the commit timestamp of a key's newest committed
+	// version (found=false if the key has never been written). It backs the
+	// transaction layer's first-committer-wins write-conflict detection.
+	LatestVersion(k Key) (ts uint64, found bool, err error)
 	Sync() error
 	// Backup streams a consistent BadgerDB backup of all committed data to w and
 	// returns the version backed up. Restore loads a backup stream into this
@@ -185,6 +189,20 @@ func (s *badgerStore) NewWriteBatchAt(commitTs uint64) WriteBatch {
 func (s *badgerStore) SetDiscardTs(ts uint64) { s.db.SetDiscardTs(ts) }
 
 func (s *badgerStore) MaxVersion() uint64 { return s.db.MaxVersion() }
+
+// LatestVersion reads a key's newest committed version timestamp at MaxVersion.
+func (s *badgerStore) LatestVersion(k Key) (uint64, bool, error) {
+	txn := s.db.NewTransactionAt(s.db.MaxVersion(), false)
+	defer txn.Discard()
+	item, err := txn.Get(k.Bytes())
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return item.Version(), true, nil
+}
 
 func (s *badgerStore) Sync() error { return s.db.Sync() }
 

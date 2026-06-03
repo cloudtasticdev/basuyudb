@@ -12,6 +12,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/ast"
@@ -24,10 +25,23 @@ import (
 // PG type OIDs used by the milestone-1 result encoder.
 const (
 	OIDBool uint32 = 16
+	OIDBytea uint32 = 17
 	OIDInt8 uint32 = 20
+	OIDInt2 uint32 = 21
 	OIDInt4 uint32 = 23
 	OIDText uint32 = 25
+	OIDJSON uint32 = 114
+	OIDFloat4 uint32 = 700
 	OIDFloat8 uint32 = 701
+	OIDVarchar uint32 = 1043
+	OIDBpchar uint32 = 1042
+	OIDDate uint32 = 1082
+	OIDTime uint32 = 1083
+	OIDTimestamp uint32 = 1114
+	OIDTimestamptz uint32 = 1184
+	OIDNumeric uint32 = 1700
+	OIDUUID uint32 = 2950
+	OIDJSONB uint32 = 3802
 	OIDUnknown uint32 = 705
 )
 
@@ -82,6 +96,21 @@ type Executor interface {
 	// SweepOTelRetention deletes otel_spans older than cutoff (RFC3339), for a
 	// background retention job. Returns the number removed.
 	SweepOTelRetention(ctx context.Context, sess *session.Session, cutoff string) (int, error)
+
+	// CopyTo returns the rows a COPY ... TO STDOUT should stream (the table scan
+	// or the embedded query).
+	CopyTo(ctx context.Context, sess *session.Session, c *ast.CopyStmt) (*Result, error)
+
+	// CopyFrom bulk-inserts rows received from a COPY ... FROM STDIN stream,
+	// honoring defaults and constraints. Returns the number of rows loaded.
+	CopyFrom(ctx context.Context, sess *session.Session, table string, columns []string, rows [][]Datum) (int64, error)
+
+	// DescribeReturning returns the result columns of an INSERT/UPDATE/DELETE
+	// ... RETURNING prepared statement, resolved from the table schema WITHOUT
+	// executing (no rows are mutated). ok is false when stmt has no RETURNING.
+	// Needed by the extended-protocol Describe path, where executing to learn
+	// the columns would be a side effect.
+	DescribeReturning(ctx context.Context, stmt ast.Node, sess *session.Session) (cols []Column, ok bool, err error)
 }
 
 // New constructs the canonical executor over a managed Store and the
@@ -101,14 +130,41 @@ func (e *execImpl) Execute(ctx context.Context, stmt ast.Node, sess *session.Ses
 	if stmt == nil {
 		return nil, newExecError("XX000", "nil statement")
 	}
+	// Autocommit statements retry on a write-write conflict (first-committer-wins
+	// snapshot isolation), matching PostgreSQL Read Committed where a concurrent
+	// update is transparently re-applied rather than surfaced. Statements inside
+	// an explicit transaction do not retry here — the conflict surfaces at COMMIT
+	// as SQLSTATE 40001 for the client to retry the whole transaction.
+	if txnFromCtx(ctx) != nil {
+		return e.executeOnce(ctx, stmt, sess, params)
+	}
+	const maxRetries = 64
+	for attempt := 0; ; attempt++ {
+		res, err := e.executeOnce(ctx, stmt, sess, params)
+		if err != nil && errors.Is(err, transactions.ErrWriteConflict) {
+			if attempt < maxRetries {
+				continue
+			}
+			return nil, newExecError("40001", "could not serialize access due to concurrent update")
+		}
+		return res, err
+	}
+}
+
+func (e *execImpl) executeOnce(ctx context.Context, stmt ast.Node, sess *session.Session, params []Datum) (*Result, error) {
 	switch s := stmt.(type) {
 	case *ast.SelectStmt:
 		return e.execSelect(ctx, s, sess, params)
 	case *ast.CreateStmt:
 		return e.execCreateTable(ctx, s, sess)
+	case *ast.CreateViewStmt:
+		return e.execCreateView(ctx, s, sess)
 	case *ast.IndexStmt:
 		return e.execCreateIndex(ctx, s, sess)
 	case *ast.DropStmt:
+		if s.IsView {
+			return e.execDropView(ctx, s, sess)
+		}
 		return e.execDropTable(ctx, s, sess)
 	case *ast.TruncateStmt:
 		return e.execTruncate(ctx, s, sess)
@@ -135,6 +191,17 @@ func (e *execImpl) Execute(ctx context.Context, stmt ast.Node, sess *session.Ses
 // targets (Gate 1). A SELECT with a single-table FROM performs a table scan
 // (milestone-3); JOINs are added at Gate 3.
 func (e *execImpl) execSelect(ctx context.Context, s *ast.SelectStmt, sess *session.Session, params []Datum) (*Result, error) {
+	// WITH: materialize CTEs and carry them in ctx for FROM resolution.
+	if s.WithClause != nil {
+		nctx, err := e.bindCTEs(ctx, sess, s.WithClause, params)
+		if err != nil {
+			return nil, err
+		}
+		ctx = nctx
+	}
+	if s.SetOp != ast.SetOpNone {
+		return e.execSetOp(ctx, s, sess, params)
+	}
 	if len(s.FromClause) > 0 {
 		return e.execSelectFrom(ctx, s, sess, params)
 	}

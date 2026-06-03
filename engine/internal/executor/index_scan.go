@@ -119,6 +119,10 @@ func (e *execImpl) planIndexScan(ctx context.Context, txn *transactions.Txn, ses
 	if !ok || rv.RelName == OTelSpansTable {
 		return nil, nil
 	}
+	// A CTE reference is not a stored table — let materialize serve it.
+	if _, isCTE := lookupCTE(ctx, rv.RelName); isCTE {
+		return nil, nil
+	}
 	alias := rv.RelName
 	if rv.Alias != nil && rv.Alias.AliasName != "" {
 		alias = rv.Alias.AliasName
@@ -219,7 +223,7 @@ func (e *execImpl) planIndexScan(ctx context.Context, txn *transactions.Txn, ses
 	// WHERE present, strict-bound rows may be filtered downstream, so we must
 	// scan the full range and let execSelectFrom apply LIMIT after filtering.
 	limit := -1
-	if orderOK && s.WhereClause == nil && s.LimitCount != nil {
+	if orderOK && s.WhereClause == nil && s.LimitCount != nil && !s.Distinct {
 		n, err := evalIntLimit(s.LimitCount, params)
 		if err != nil {
 			return nil, err

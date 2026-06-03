@@ -70,6 +70,34 @@ func (e *execImpl) materialize(ctx context.Context, txn *transactions.Txn, sess 
 		if n.Alias != nil && n.Alias.AliasName != "" {
 			alias = n.Alias.AliasName
 		}
+		// Common table expression reference: serve the materialized rows.
+		if n.SchemaName == "" {
+			if ent, ok := lookupCTE(ctx, n.RelName); ok {
+				rows := make([]boundRow, 0, len(ent.rows))
+				for _, cells := range ent.rows {
+					rows = append(rows, boundRow{{alias: alias, schema: ent.schema, cells: cells}})
+				}
+				return rows, nil
+			}
+			// View reference: parse and execute the stored definition.
+			if sql, ok, err := e.loadViewSQL(ctx, txn, sess, n.RelName); err != nil {
+				return nil, err
+			} else if ok {
+				return e.materializeView(ctx, sess, alias, sql)
+			}
+		}
+		// Catalog views (information_schema.* / pg_catalog.*) for ORM introspection.
+		if n.SchemaName != "" {
+			if csch, crows, ok, err := e.catalogVirtualTable(ctx, txn, sess, n.SchemaName, n.RelName); err != nil {
+				return nil, err
+			} else if ok {
+				rows := make([]boundRow, 0, len(crows))
+				for _, cells := range crows {
+					rows = append(rows, boundRow{{alias: alias, schema: csch, cells: cells}})
+				}
+				return rows, nil
+			}
+		}
 		sc, err := e.scanTable(ctx, txn, sess, n.RelName, alias)
 		if err != nil {
 			return nil, err
@@ -279,8 +307,11 @@ func (e *execImpl) execSelectFrom(ctx context.Context, s *ast.SelectStmt, sess *
 		}
 	}
 
-	// LIMIT.
-	if s.LimitCount != nil {
+	// LIMIT is deferred past projection when DISTINCT (dedup first) or window
+	// functions (computed over the full partition) are present, so it lands on
+	// the final projected rows.
+	deferLimit := s.Distinct || hasWindowFunc(s.TargetList)
+	if s.LimitCount != nil && !deferLimit {
 		lim, err := evalIntLimit(s.LimitCount, params)
 		if err != nil {
 			return nil, err
@@ -290,7 +321,51 @@ func (e *execImpl) execSelectFrom(ctx context.Context, s *ast.SelectStmt, sess *
 		}
 	}
 
-	return e.projectRows(ctx, sess, s, kept, params)
+	res, err := e.projectRows(ctx, sess, s, kept, params)
+	if err != nil {
+		return nil, err
+	}
+	if s.Distinct {
+		res.Rows = dedupRows(res.Rows)
+	}
+	if s.LimitCount != nil && deferLimit {
+		lim, err := evalIntLimit(s.LimitCount, params)
+		if err != nil {
+			return nil, err
+		}
+		if lim >= 0 && lim < len(res.Rows) {
+			res.Rows = res.Rows[:lim]
+		}
+	}
+	return res, nil
+}
+
+// dedupRows removes duplicate rows by full-tuple equality, preserving the first
+// occurrence order. NULLs are treated as equal to one another (SQL DISTINCT
+// semantics, unlike UNIQUE which treats NULLs as distinct).
+func dedupRows(rows [][]Datum) [][]Datum {
+	seen := make(map[string]bool, len(rows))
+	out := rows[:0:0]
+	for _, r := range rows {
+		var b strings.Builder
+		for _, d := range r {
+			if d.Null {
+				b.WriteByte(0)
+				b.WriteByte('N')
+			} else {
+				b.WriteByte(1)
+				b.WriteString(d.Text)
+			}
+			b.WriteByte('|')
+		}
+		k := b.String()
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, r)
+	}
+	return out
 }
 
 // projectRows turns the final ordered/limited boundRows into a Result, expanding
@@ -301,9 +376,15 @@ func (e *execImpl) projectRows(ctx context.Context, sess *session.Session, s *as
 		_, starExpand = s.TargetList[0].Val.(*ast.A_Star)
 	}
 
+	// Precompute window-function values (partition-aware) if any are present.
+	windowVals, err := e.computeWindows(rows, s.TargetList, params)
+	if err != nil {
+		return nil, err
+	}
+
 	var cols []Column
 	outRows := make([][]Datum, 0, len(rows))
-	for _, row := range rows {
+	for ri, row := range rows {
 		if starExpand {
 			if cols == nil {
 				for _, b := range row {
@@ -320,7 +401,7 @@ func (e *execImpl) projectRows(ctx context.Context, sess *session.Session, s *as
 			continue
 		}
 
-		ev := &evaluator{params: params, resolveCol: combinedResolver(row)}
+		ev := &evaluator{params: params, resolveCol: combinedResolver(row), windowVals: windowVals, rowIdx: ri}
 		out := make([]Datum, len(s.TargetList))
 		rowCols := make([]Column, len(s.TargetList))
 		for i, t := range s.TargetList {

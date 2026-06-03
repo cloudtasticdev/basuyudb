@@ -53,7 +53,13 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 	}
 	ev := &evaluator{params: params}
 	provided := make([]value, len(valSel.TargetList))
+	isDefault := make([]bool, len(valSel.TargetList))
 	for i, t := range valSel.TargetList {
+		// DEFAULT keyword as a value (ORMs emit it): defer to the column default.
+		if _, ok := t.Val.(*ast.SetToDefault); ok {
+			isDefault[i] = true
+			continue
+		}
 		v, err := ev.eval(t.Val)
 		if err != nil {
 			return nil, err
@@ -86,9 +92,30 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 	for i := range cells {
 		cells[i] = Datum{Null: true}
 	}
+	providedSet := make(map[int]bool, len(targetCols))
 	for j, colIdx := range targetCols {
+		// A DEFAULT-valued column is left unprovided so the column-default pass
+		// (serial/now()/literal/NULL) fills it.
+		if isDefault[j] {
+			continue
+		}
 		v := provided[j]
 		cells[colIdx] = Datum{Null: v.null, Text: v.text}
+		providedSet[colIdx] = true
+	}
+
+	// Column DEFAULTs (incl. SERIAL sequences, now(), gen_random_uuid()) for any
+	// column not named in the INSERT. Applied before key computation so a serial
+	// or defaulted primary key is materialized in time.
+	for i, c := range sch.Cols {
+		if providedSet[i] || c.Default == nil {
+			continue
+		}
+		d, err := e.evalDefault(ctx, txn, sess, c.Default)
+		if err != nil {
+			return nil, err
+		}
+		cells[i] = d
 	}
 
 	// NOT NULL enforcement.
@@ -96,6 +123,14 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 		if c.NotNull && cells[i].Null {
 			return nil, newExecError("23502", "null value in column %q violates not-null constraint", c.Name)
 		}
+	}
+
+	// CHECK and FOREIGN KEY (child-side) constraint enforcement.
+	if err := e.enforceChecks(sch, table, cells, params); err != nil {
+		return nil, err
+	}
+	if err := e.enforceFKChild(ctx, txn, sess, sch, cells); err != nil {
+		return nil, err
 	}
 
 	// Compute the row key. otel_spans is keyed by (trace_id, span_id) via
@@ -118,9 +153,12 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 		}
 		rowKey = enc.RowKey(sess.Namespace(), sess.Branch(), table, pk)
 
-		// Reject duplicate primary key.
-		if _, err := e.txn.Get(ctx, txn, rowKey); err == nil {
-			return nil, newExecError("23505", "duplicate key value violates unique constraint on %q", table)
+		// Duplicate primary key: error, or apply the ON CONFLICT action.
+		if existing, err := e.txn.Get(ctx, txn, rowKey); err == nil {
+			if s.OnConflict == nil {
+				return nil, newExecError("23505", "duplicate key value violates unique constraint on %q", table)
+			}
+			return e.handleOnConflict(ctx, txn, owns, sess, sch, table, rowKey, cells, existing, s, params)
 		}
 	}
 
@@ -152,10 +190,19 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 	if err := e.indexEntries(txn, sess, sch, defs, cells, rowKey, true); err != nil {
 		return nil, err
 	}
+	result := &Result{Command: "INSERT", RowsAffected: 1}
+	if len(s.ReturningList) > 0 {
+		rr, err := projectReturning(sch, table, s.ReturningList, [][]Datum{cells}, params)
+		if err != nil {
+			return nil, err
+		}
+		rr.Command, rr.RowsAffected = "INSERT", 1
+		result = rr
+	}
 	if err := e.commitTx(ctx, txn, owns); err != nil {
 		return nil, err
 	}
-	return &Result{Command: "INSERT", RowsAffected: 1}, nil
+	return result, nil
 }
 
 // indexHasOtherPK reports whether a unique index already maps encVal (the
@@ -223,6 +270,7 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 	}
 
 	count := 0
+	var affected [][]Datum
 	for _, r := range sc.rows {
 		oldCells := append([]Datum(nil), r.cells...)
 		cells := append([]Datum(nil), r.cells...)
@@ -246,6 +294,25 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 				return nil, err
 			}
 			cells[idx] = Datum{Null: v.null, Text: v.text}
+		}
+		// NOT NULL, CHECK and FK (child-side) on the updated row.
+		for i, c := range sch.Cols {
+			if c.NotNull && cells[i].Null {
+				return nil, newExecError("23502", "null value in column %q violates not-null constraint", c.Name)
+			}
+		}
+		if err := e.enforceChecks(sch, table, cells, params); err != nil {
+			return nil, err
+		}
+		if err := e.enforceFKChild(ctx, txn, sess, sch, cells); err != nil {
+			return nil, err
+		}
+		// If this row's primary key changed and other tables reference it,
+		// block the change (ON UPDATE RESTRICT, the default).
+		if sch.PKIndex >= 0 && oldCells[sch.PKIndex].Text != cells[sch.PKIndex].Text {
+			if err := e.enforceFKParent(ctx, txn, sess, table, oldCells[sch.PKIndex].Text); err != nil {
+				return nil, err
+			}
 		}
 		// Enforce UNIQUE for changed index tuples.
 		for _, d := range defs {
@@ -276,12 +343,24 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 		if err := e.indexEntries(txn, sess, sch, defs, cells, r.key, true); err != nil {
 			return nil, err
 		}
+		if len(s.ReturningList) > 0 {
+			affected = append(affected, cells)
+		}
 		count++
+	}
+	result := &Result{Command: "UPDATE", RowsAffected: count}
+	if len(s.ReturningList) > 0 {
+		rr, err := projectReturning(sch, table, s.ReturningList, affected, params)
+		if err != nil {
+			return nil, err
+		}
+		rr.Command, rr.RowsAffected = "UPDATE", count
+		result = rr
 	}
 	if err := e.commitTx(ctx, txn, owns); err != nil {
 		return nil, err
 	}
-	return &Result{Command: "UPDATE", RowsAffected: count}, nil
+	return result, nil
 }
 
 // execDelete deletes rows matching WHERE. On main the key is removed; on a
@@ -308,6 +387,7 @@ func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *sess
 	}
 
 	count := 0
+	var affected [][]Datum
 	for _, r := range sc.rows {
 		ev := &evaluator{params: params, resolveCol: rowResolver(sch, table, r.cells)}
 		if s.WhereClause != nil {
@@ -319,6 +399,13 @@ func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *sess
 				continue
 			}
 		}
+		// FK parent-side: refuse to delete a row still referenced by a child
+		// (ON DELETE RESTRICT, the default).
+		if sch.PKIndex >= 0 {
+			if err := e.enforceFKParent(ctx, txn, sess, table, r.cells[sch.PKIndex].Text); err != nil {
+				return nil, err
+			}
+		}
 		bk := e.branchRowKey(sess, table, sch, r.cells, r.key)
 		if onBranch {
 			e.txn.Buffer(txn, transactions.Mutation{Key: bk, Value: storage.Tombstone()})
@@ -328,7 +415,21 @@ func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *sess
 		if err := e.indexEntries(txn, sess, sch, defs, r.cells, r.key, false); err != nil {
 			return nil, err
 		}
+		if len(s.ReturningList) > 0 {
+			affected = append(affected, append([]Datum(nil), r.cells...))
+		}
 		count++
+	}
+	if len(s.ReturningList) > 0 {
+		rr, err := projectReturning(sch, table, s.ReturningList, affected, params)
+		if err != nil {
+			return nil, err
+		}
+		rr.Command, rr.RowsAffected = "DELETE", count
+		if err := e.commitTx(ctx, txn, owns); err != nil {
+			return nil, err
+		}
+		return rr, nil
 	}
 	if err := e.commitTx(ctx, txn, owns); err != nil {
 		return nil, err

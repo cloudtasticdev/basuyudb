@@ -3,6 +3,7 @@ package transactions
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/auth"
@@ -66,6 +67,12 @@ type TransactionEngine interface {
 // ErrTxnDone is returned when a committed/rolled-back txn is reused.
 var ErrTxnDone = errors.New("transactions: transaction already completed")
 
+// ErrWriteConflict is returned by Commit when another transaction committed a
+// newer version of a key in this transaction's write set since its read
+// snapshot — first-committer-wins snapshot isolation. Callers retry (autocommit
+// statements retry internally; explicit transactions surface SQLSTATE 40001).
+var ErrWriteConflict = errors.New("transactions: write-write conflict")
+
 // engine is the single-node TransactionEngine over a managed Store.
 type engine struct {
 	store storage.Store
@@ -75,6 +82,9 @@ type engine struct {
 	// drives BadgerDB read/commit timestamps. Reads see all commits with a
 	// commit timestamp <= the reader's snapshot.
 	clock atomic.Uint64
+	// commitMu serializes the conflict-check + flush so the check and the commit
+	// timestamp assignment are atomic (no commit can interleave between them).
+	commitMu sync.Mutex
 }
 
 // New constructs the single-node transaction engine. nodeID seeds the HLC.
@@ -173,12 +183,31 @@ func (e *engine) Commit(ctx context.Context, txn *Txn) error {
 	if txn.done {
 		return ErrTxnDone
 	}
-	txn.done = true
 	if len(txn.mutations) == 0 {
+		txn.done = true
 		return nil
 	}
 
-	commitTS := e.clock.Add(1)
+	// First-committer-wins: serialize commits, then reject if any written key has
+	// a committed version newer than this txn's read snapshot.
+	e.commitMu.Lock()
+	defer e.commitMu.Unlock()
+	for _, m := range txn.mutations {
+		ts, found, err := e.store.LatestVersion(m.Key)
+		if err != nil {
+			return err
+		}
+		if found && ts > txn.readUint {
+			txn.done = true
+			return ErrWriteConflict
+		}
+	}
+	txn.done = true
+
+	// Reserve a commit timestamp but DO NOT publish it to the read oracle until
+	// the batch is durably flushed — otherwise a reader could capture this
+	// timestamp as its snapshot and observe a half-applied commit (read skew).
+	commitTS := e.clock.Load() + 1
 	wb := e.store.NewWriteBatchAt(commitTS)
 	for _, m := range txn.mutations {
 		var err error
@@ -195,6 +224,9 @@ func (e *engine) Commit(ctx context.Context, txn *Txn) error {
 	if err := wb.Flush(); err != nil {
 		return err
 	}
+	// Now durable: publish the commit timestamp to the read oracle so subsequent
+	// snapshots see this commit atomically (all keys, never a subset).
+	e.clock.Store(commitTS)
 	// Replicate (single-node: no-op). The edge is identical to the Gate-4 path.
 	return e.committer.Propose(ctx, 0, txn.mutations)
 }

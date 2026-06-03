@@ -2,8 +2,10 @@ package executor
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/version"
@@ -28,6 +30,10 @@ type evaluator struct {
 	group []boundRow
 	// runSub, when non-nil, executes an (uncorrelated) scalar or IN subquery.
 	runSub func(*ast.SelectStmt) (*Result, error)
+	// windowVals holds precomputed per-row values for window function calls, and
+	// rowIdx is the current output row; set during windowed projection.
+	windowVals map[ast.Node][]value
+	rowIdx int
 }
 
 // asBool interprets a value as a SQL boolean for WHERE/HAVING/ON predicates.
@@ -65,7 +71,13 @@ func (ev *evaluator) eval(n ast.Node) (value, error) {
 		return ev.evalScalarSub(e)
 
 	case *ast.FuncCall:
+		if e.Over != nil {
+			return ev.evalWindowRef(e)
+		}
 		return ev.evalFunc(e)
+
+	case *ast.CaseExpr:
+		return ev.evalCase(e)
 
 	case *ast.TypeCast:
 		// Milestone-1: evaluate the inner expression and report the cast type's
@@ -219,9 +231,184 @@ func (ev *evaluator) evalFunc(f *ast.FuncCall) (value, error) {
 		return value{text: "defaultdb", oid: OIDText}, nil
 	case "current_schema":
 		return value{text: "public", oid: OIDText}, nil
-	default:
-		return value{}, newExecError("42883", "function %q does not exist (milestone-1)", name)
 	}
+	// General scalar function library (COALESCE/NULLIF/string/math/time).
+	return ev.evalScalarFunc(name, f)
+}
+
+// evalScalarFunc implements the common scalar functions ORMs and query builders
+// emit. Args are evaluated lazily where it matters (COALESCE short-circuits).
+func (ev *evaluator) evalScalarFunc(name string, f *ast.FuncCall) (value, error) {
+	switch name {
+	case "now", "current_timestamp", "transaction_timestamp", "statement_timestamp", "clock_timestamp":
+		return value{text: nowText(), oid: OIDTimestamptz}, nil
+	case "current_date":
+		return value{text: nowText()[:10], oid: OIDDate}, nil
+	case "gen_random_uuid", "uuid_generate_v4":
+		u, err := randomUUIDv4()
+		if err != nil {
+			return value{}, err
+		}
+		return value{text: u, oid: OIDUUID}, nil
+	case "coalesce":
+		for _, a := range f.Args {
+			v, err := ev.eval(a)
+			if err != nil {
+				return value{}, err
+			}
+			if !v.null {
+				return v, nil
+			}
+		}
+		return value{null: true, oid: OIDUnknown}, nil
+	case "nullif":
+		if len(f.Args) != 2 {
+			return value{}, newExecError("42883", "nullif requires 2 arguments")
+		}
+		a, err := ev.eval(f.Args[0])
+		if err != nil {
+			return value{}, err
+		}
+		b, err := ev.eval(f.Args[1])
+		if err != nil {
+			return value{}, err
+		}
+		if !a.null && !b.null {
+			if eq, err := compare("=", a, b); err == nil && asBool(eq) {
+				return value{null: true, oid: a.oid}, nil
+			}
+		}
+		return a, nil
+	}
+
+	// One-argument string/math helpers share an evaluate-first path.
+	args, err := ev.evalArgs(f.Args)
+	if err != nil {
+		return value{}, err
+	}
+	switch name {
+	case "length", "char_length", "character_length":
+		if len(args) != 1 {
+			return value{}, newExecError("42883", "%s requires 1 argument", name)
+		}
+		if args[0].null {
+			return value{null: true, oid: OIDInt4}, nil
+		}
+		return value{text: strconv.Itoa(len([]rune(args[0].text))), oid: OIDInt4}, nil
+	case "upper":
+		return strFn(args, strings.ToUpper)
+	case "lower":
+		return strFn(args, strings.ToLower)
+	case "trim", "btrim":
+		return strFn(args, strings.TrimSpace)
+	case "ltrim":
+		return strFn(args, func(s string) string { return strings.TrimLeft(s, " ") })
+	case "rtrim":
+		return strFn(args, func(s string) string { return strings.TrimRight(s, " ") })
+	case "concat":
+		var b strings.Builder
+		for _, a := range args {
+			if !a.null {
+				b.WriteString(a.text)
+			}
+		}
+		return value{text: b.String(), oid: OIDText}, nil
+	case "abs":
+		return mathFn1(args, math.Abs)
+	case "ceil", "ceiling":
+		return mathFn1(args, math.Ceil)
+	case "floor":
+		return mathFn1(args, math.Floor)
+	case "round":
+		return mathFn1(args, math.Round)
+	case "sqrt":
+		return mathFn1(args, math.Sqrt)
+	default:
+		return value{}, newExecError("42883", "function %q does not exist", name)
+	}
+}
+
+// evalArgs evaluates all arguments of a function call.
+func (ev *evaluator) evalArgs(nodes []ast.Node) ([]value, error) {
+	out := make([]value, len(nodes))
+	for i, n := range nodes {
+		v, err := ev.eval(n)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+
+func strFn(args []value, fn func(string) string) (value, error) {
+	if len(args) != 1 {
+		return value{}, newExecError("42883", "string function requires 1 argument")
+	}
+	if args[0].null {
+		return value{null: true, oid: OIDText}, nil
+	}
+	return value{text: fn(args[0].text), oid: OIDText}, nil
+}
+
+func mathFn1(args []value, fn func(float64) float64) (value, error) {
+	if len(args) != 1 {
+		return value{}, newExecError("42883", "math function requires 1 argument")
+	}
+	if args[0].null {
+		return value{null: true, oid: OIDFloat8}, nil
+	}
+	x, err := strconv.ParseFloat(args[0].text, 64)
+	if err != nil {
+		return value{}, numErr(args[0].text)
+	}
+	r := fn(x)
+	// Preserve integer-ness for integer inputs to abs/ceil/floor/round.
+	if r == math.Trunc(r) && args[0].oid != OIDFloat8 && args[0].oid != OIDNumeric {
+		return value{text: strconv.FormatInt(int64(r), 10), oid: OIDInt8}, nil
+	}
+	return value{text: strconv.FormatFloat(r, 'g', -1, 64), oid: OIDFloat8}, nil
+}
+
+// evalCase evaluates a CASE expression (searched or simple form), returning the
+// first matching arm's result, the ELSE result, or NULL.
+func (ev *evaluator) evalCase(c *ast.CaseExpr) (value, error) {
+	var arg *value
+	if c.Arg != nil {
+		v, err := ev.eval(c.Arg)
+		if err != nil {
+			return value{}, err
+		}
+		arg = &v
+	}
+	for _, w := range c.Whens {
+		cv, err := ev.eval(w.Cond)
+		if err != nil {
+			return value{}, err
+		}
+		matched := false
+		if arg == nil {
+			matched = asBool(cv) // searched CASE: Cond is a predicate
+		} else if !arg.null && !cv.null { // simple CASE: arg = value
+			eq, err := compare("=", *arg, cv)
+			if err != nil {
+				return value{}, err
+			}
+			matched = asBool(eq)
+		}
+		if matched {
+			return ev.eval(w.Result)
+		}
+	}
+	if c.Else != nil {
+		return ev.eval(c.Else)
+	}
+	return value{null: true, oid: OIDUnknown}, nil
+}
+
+// nowText returns the current UTC time in PostgreSQL text format.
+func nowText() string {
+	return time.Now().UTC().Format("2006-01-02 15:04:05.999999")
 }
 
 func negate(v value) (value, error) {
@@ -343,15 +530,43 @@ func isNumericOID(oid uint32) bool { return oid == OIDInt4 || oid == OIDInt8 || 
 func numErr(s string) error { return newExecError("22P02", "invalid numeric value %q", s) }
 
 func oidForTypeName(name string) uint32 {
-	switch strings.ToLower(name) {
-	case "int", "int4", "integer":
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "int", "int4", "integer", "serial":
 		return OIDInt4
-	case "bigint", "int8":
+	case "bigint", "int8", "bigserial":
 		return OIDInt8
-	case "float8", "double precision", "real":
+	case "smallint", "int2", "smallserial":
+		return OIDInt2
+	case "real", "float4":
+		return OIDFloat4
+	case "float8", "double precision", "float":
 		return OIDFloat8
+	case "numeric", "decimal":
+		return OIDNumeric
 	case "bool", "boolean":
 		return OIDBool
+	case "uuid":
+		return OIDUUID
+	case "json":
+		return OIDJSON
+	case "jsonb":
+		return OIDJSONB
+	case "bytea":
+		return OIDBytea
+	case "date":
+		return OIDDate
+	case "time", "time without time zone", "time with time zone", "timetz":
+		return OIDTime
+	case "timestamp", "timestamp without time zone":
+		return OIDTimestamp
+	case "timestamptz", "timestamp with time zone":
+		return OIDTimestamptz
+	case "varchar", "character varying":
+		return OIDVarchar
+	case "char", "character", "bpchar":
+		return OIDBpchar
+	case "text":
+		return OIDText
 	default:
 		return OIDText
 	}
