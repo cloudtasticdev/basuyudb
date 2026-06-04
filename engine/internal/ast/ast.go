@@ -46,6 +46,21 @@ const (
 	T_CreateViewStmt
 	T_CopyStmt
 	T_SetToDefault
+	T_ShowStmt
+	T_SavepointStmt
+	T_CreateSeqStmt
+	T_CreateSchemaStmt
+	T_CreateExtensionStmt
+	T_CreateEnumStmt
+	T_ListenStmt
+	T_DoNothingStmt
+	T_ExplainStmt
+	T_RowExpr
+	T_FieldSelect
+	T_CreatePolicyStmt
+	T_AlterPolicyStmt
+	T_DropPolicyStmt
+	T_CreateTypeStmt
 )
 
 // Node is the single canonical AST interface. Every AST node implements it.
@@ -88,6 +103,9 @@ func TagOf(n Node) NodeTag {
 type SelectStmt struct {
 	WithClause *WithClause // optional CTEs
 	Distinct bool // SELECT DISTINCT
+	// DistinctOn carries the expression list of SELECT DISTINCT ON (exprs).
+	// When set, Distinct is also true. Empty/nil for plain DISTINCT or none.
+	DistinctOn []Node
 	TargetList []*ResTarget
 	FromClause []Node // RangeVar | JoinExpr | SubLink (subquery in FROM)
 	WhereClause Node // boolean expression or nil
@@ -181,6 +199,7 @@ type InsertStmt struct {
 	Relation *RangeVar
 	Cols []*ResTarget
 	SelectStmt Node // VALUES list (SelectStmt with no FromClause) or subquery
+	MultiRows  [][]Node // non-nil when multi-row VALUES; each inner slice is one row
 	ReturningList []*ResTarget
 	OnConflict *OnConflictClause // optional ON CONFLICT action
 }
@@ -260,8 +279,9 @@ func (s *UpdateStmt) walkChildren(fn func(Node) error) error {
 
 // DeleteStmt — DELETE FROM relation WHERE.
 type DeleteStmt struct {
-	Relation *RangeVar
-	WhereClause Node
+	Relation      *RangeVar
+	UsingClause   []Node // DELETE ... USING table_list
+	WhereClause   Node
 	ReturningList []*ResTarget
 }
 
@@ -269,6 +289,11 @@ func (*DeleteStmt) nodeTag() NodeTag { return T_DeleteStmt }
 func (s *DeleteStmt) walkChildren(fn func(Node) error) error {
 	if s.Relation != nil {
 		if err := fn(s.Relation); err != nil {
+			return err
+		}
+	}
+	for _, u := range s.UsingClause {
+		if err := fn(u); err != nil {
 			return err
 		}
 	}
@@ -404,11 +429,15 @@ type A_ExprKind int32
 
 const (
 	AEXPR_OP A_ExprKind = iota // any binary/unary operator named by Name
-	AEXPR_OP_ANY // op ANY (array)
-	AEXPR_IN // IN (...)
-	AEXPR_LIKE // LIKE
-	AEXPR_ILIKE // ILIKE
-	AEXPR_BETWEEN // BETWEEN
+	AEXPR_OP_ANY               // op ANY (array)
+	AEXPR_IN                   // IN (...)
+	AEXPR_LIKE                 // LIKE
+	AEXPR_ILIKE                // ILIKE
+	AEXPR_BETWEEN              // BETWEEN
+	AEXPR_NOT_LIKE             // NOT LIKE
+	AEXPR_NOT_ILIKE            // NOT ILIKE
+	AEXPR_SIMILAR_TO           // SIMILAR TO
+	AEXPR_NOT_SIMILAR_TO       // NOT SIMILAR TO
 )
 
 // A_Expr is an operator expression. For JSONB extraction the Name carries the
@@ -437,6 +466,26 @@ func (e *A_Expr) walkChildren(fn func(Node) error) error {
 	}
 	if e.Rexpr != nil {
 		if err := fn(e.Rexpr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RowExpr is a ROW(...) constructor or the bare implicit row form
+// `(a, b, ...)` used in e.g. `WHERE (a,b) IN (...)`. Items holds the row's
+// element expressions in order.
+type RowExpr struct {
+	Items []Node
+}
+
+func (*RowExpr) nodeTag() NodeTag { return T_RowExpr }
+func (r *RowExpr) walkChildren(fn func(Node) error) error {
+	for _, it := range r.Items {
+		if it == nil {
+			continue
+		}
+		if err := fn(it); err != nil {
 			return err
 		}
 	}
@@ -473,11 +522,17 @@ func (*ParamRef) walkChildren(fn func(Node) error) error { return nil }
 
 // FuncCall is a function/aggregate call. fts_match, fts_score, similarity,
 // basuyudb_cluster_status, etc. are all FuncCall nodes (no bespoke AST type).
+// When used as a FROM-clause table function (e.g. generate_series), Alias
+// carries the AS alias and optional column aliases.
 type FuncCall struct {
-	FuncName []string // qualified name parts, e.g. ["fts_match"]
-	Args []Node
-	AggStar bool // COUNT(*)
-	Over *WindowDef // non-nil when called as a window function: f(...) OVER (...)
+	FuncName    []string   // qualified name parts, e.g. ["fts_match"]
+	Args        []Node
+	AggStar     bool       // COUNT(*)
+	AggDistinct bool       // COUNT(DISTINCT x)
+	Over        *WindowDef // non-nil when called as a window function: f(...) OVER (...)
+	Filter      Node       // FILTER (WHERE expr) for filtered aggregates
+	WithinGroup *WindowDef // WITHIN GROUP (ORDER BY ...) for ordered-set aggregates
+	Alias       *Alias     // non-nil when used as a set-returning function in FROM
 }
 
 // WindowDef is the OVER (...) specification of a window function call.
@@ -575,8 +630,9 @@ func (w *WithClause) walkChildren(fn func(Node) error) error {
 }
 
 type CommonTableExpr struct {
-	Name string
-	Query Node // SelectStmt
+	Name  string
+	Cols  []string // optional column list for RECURSIVE CTEs: WITH name(cols) AS (...)
+	Query Node     // SelectStmt
 }
 
 func (*CommonTableExpr) nodeTag() NodeTag { return T_CommonTableExpr }
@@ -607,6 +663,7 @@ func (l *List) walkChildren(fn func(Node) error) error {
 type SubLink struct {
 	SubSelect Node // SelectStmt
 	Alias *Alias
+	Exists bool // EXISTS (subquery)
 }
 
 func (*SubLink) nodeTag() NodeTag { return T_SubLink }
@@ -618,6 +675,30 @@ func (s *SubLink) walkChildren(fn func(Node) error) error {
 	}
 	if s.Alias != nil {
 		if err := fn(s.Alias); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RangeSubselect is a subquery in the FROM clause with an alias.
+// When Lateral is true the subquery was preceded by the LATERAL keyword and
+// may reference columns from preceding FROM items.
+type RangeSubselect struct {
+	Subquery Node   // SelectStmt
+	Alias    *Alias // always non-nil; the alias is required
+	Lateral  bool   // LATERAL keyword was present
+}
+
+func (*RangeSubselect) nodeTag() NodeTag { return T_SubLink } // reuse SubLink tag for now
+func (r *RangeSubselect) walkChildren(fn func(Node) error) error {
+	if r.Subquery != nil {
+		if err := fn(r.Subquery); err != nil {
+			return err
+		}
+	}
+	if r.Alias != nil {
+		if err := fn(r.Alias); err != nil {
 			return err
 		}
 	}
@@ -648,8 +729,15 @@ func (*A_Star) walkChildren(fn func(Node) error) error { return nil }
 // as a slice of ColumnDef (handled by the executor's DDL path, not as bespoke
 // AST node types beyond this statement node).
 type CreateStmt struct {
-	Relation *RangeVar
-	TableElts []ColumnDef
+	Relation    *RangeVar
+	TableElts   []ColumnDef
+	IfNotExists bool
+	Temporary   bool        // CREATE TEMP TABLE / CREATE TEMPORARY TABLE
+	AsSelect    *SelectStmt // non-nil for CREATE TABLE ... AS SELECT
+	// TableConstraints carries table-level constraints declared inline in the
+	// CREATE TABLE element list (composite PRIMARY KEY / UNIQUE / FOREIGN KEY /
+	// CHECK). Each reuses AlterTableConstraint as its representation.
+	TableConstraints []*AlterTableConstraint
 }
 
 func (*CreateStmt) nodeTag() NodeTag { return T_CreateStmt }
@@ -667,6 +755,28 @@ type ColumnDef struct {
 	Check Node   // optional CHECK (expr) constraint
 	FKTable string  // REFERENCES target table (empty if no FK)
 	FKColumn string // REFERENCES target column (empty -> parent PK)
+	// FKName carries the optional `CONSTRAINT name` prefix of an inline
+	// REFERENCES clause. FKDeferrable / FKInitiallyDeferred carry its
+	// [NOT] DEFERRABLE and INITIALLY { DEFERRED | IMMEDIATE } flags. These are
+	// folded from the column's ColQual list by NewColumnDef so the executor can
+	// persist them for DEFERRABLE constraint checking (SET CONSTRAINTS).
+	FKName              string
+	FKDeferrable        bool
+	FKInitiallyDeferred bool
+
+	// Identity / IdentityAlways: GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY.
+	// The executor treats an identity column like SERIAL.
+	Identity       bool
+	IdentityAlways bool
+
+	// Generated / GeneratedExpr: GENERATED ALWAYS AS ( expr ) STORED.
+	Generated     bool
+	GeneratedExpr Node
+
+	// FKOnDelete / FKOnUpdate: referential actions for the inline REFERENCES
+	// clause. Canonical strings ("CASCADE", "SET NULL", ...); empty if omitted.
+	FKOnDelete string
+	FKOnUpdate string
 }
 
 // CaseExpr is a CASE expression. Arg is non-nil for the simple form
@@ -723,6 +833,8 @@ const (
 	ColQualDefault
 	ColQualReferences // FOREIGN KEY: REFERENCES table[(col)]
 	ColQualCheck      // CHECK (expr)
+	ColQualIdentity   // GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY
+	ColQualGenerated  // GENERATED ALWAYS AS ( expr ) STORED
 )
 
 // ColQual is one inline column constraint. Expr is set for ColQualDefault and
@@ -732,6 +844,31 @@ type ColQual struct {
 	Expr Node
 	RefTable string
 	RefCol string
+	// ConstraintName is the optional `CONSTRAINT name` prefix.
+	ConstraintName string
+	// Deferrable / InitiallyDeferred carry [NOT] DEFERRABLE and
+	// INITIALLY { DEFERRED | IMMEDIATE }. Parsed and stored for
+	// compatibility (Rails/Django migrations); not enforced single-node.
+	Deferrable        bool
+	InitiallyDeferred bool
+
+	// Identity / IdentityAlways carry GENERATED { ALWAYS | BY DEFAULT } AS
+	// IDENTITY (Kind == ColQualIdentity). IdentityAlways is true for ALWAYS,
+	// false for BY DEFAULT. The executor treats identity like SERIAL.
+	Identity       bool
+	IdentityAlways bool
+
+	// Generated / GeneratedExpr carry GENERATED ALWAYS AS ( expr ) STORED
+	// (Kind == ColQualGenerated). GeneratedExpr is the generation expression.
+	Generated     bool
+	GeneratedExpr Node
+
+	// OnDelete / OnUpdate carry the trailing referential actions of a
+	// REFERENCES / FOREIGN KEY clause (Kind == ColQualReferences). Canonical
+	// strings: "NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT".
+	// Empty when omitted.
+	OnDelete string
+	OnUpdate string
 }
 
 // NewColumnDef folds an ordered list of inline qualifiers onto a base column
@@ -754,18 +891,32 @@ func NewColumnDef(name, typeName string, quals []ColQual) ColumnDef {
 		case ColQualReferences:
 			cd.FKTable = q.RefTable
 			cd.FKColumn = q.RefCol
+			cd.FKOnDelete = q.OnDelete
+			cd.FKOnUpdate = q.OnUpdate
+			cd.FKName = q.ConstraintName
+			cd.FKDeferrable = q.Deferrable
+			cd.FKInitiallyDeferred = q.InitiallyDeferred
 		case ColQualCheck:
 			cd.Check = q.Expr
+		case ColQualIdentity:
+			cd.Identity = true
+			cd.IdentityAlways = q.IdentityAlways
+			cd.NotNull = true
+		case ColQualGenerated:
+			cd.Generated = true
+			cd.GeneratedExpr = q.GeneratedExpr
 		}
 	}
 	return cd
 }
 
-// CreateViewStmt — CREATE [OR REPLACE] VIEW name AS query.
+// CreateViewStmt — CREATE [OR REPLACE] [MATERIALIZED] VIEW name AS query.
 type CreateViewStmt struct {
-	Relation *RangeVar
-	Query    Node // SelectStmt
-	Replace  bool
+	Relation     *RangeVar
+	Query        Node   // SelectStmt
+	Replace      bool
+	Materialized bool   // CREATE MATERIALIZED VIEW
+	IfNotExists  bool   // CREATE MATERIALIZED VIEW IF NOT EXISTS
 }
 
 func (*CreateViewStmt) nodeTag() NodeTag { return T_CreateViewStmt }
@@ -783,6 +934,14 @@ type SetToDefault struct{}
 
 func (*SetToDefault) nodeTag() NodeTag                       { return T_SetToDefault }
 func (*SetToDefault) walkChildren(fn func(Node) error) error { return nil }
+
+// ShowStmt — SHOW <name> (a run-time configuration parameter / GUC).
+type ShowStmt struct {
+	Name string
+}
+
+func (*ShowStmt) nodeTag() NodeTag                       { return T_ShowStmt }
+func (*ShowStmt) walkChildren(fn func(Node) error) error { return nil }
 
 // CopyStmt — COPY table [(cols)] FROM STDIN / TO STDOUT, or COPY (query) TO
 // STDOUT. IsFrom distinguishes load (FROM STDIN) from export (TO STDOUT).
@@ -804,22 +963,40 @@ func (s *CopyStmt) walkChildren(fn func(Node) error) error {
 	return nil
 }
 
-// IndexStmt — CREATE [UNIQUE] INDEX name ON table (col, ...).
+// IndexElem is one element of a CREATE INDEX column list. Exactly one of
+// ColName (a plain column index element) or Expr (an expression index element,
+// e.g. ( lower(name) )) is set.
+type IndexElem struct {
+	ColName string
+	Expr    Node
+}
+
+// IndexStmt — CREATE [UNIQUE] INDEX name ON table (elem, ...) [WHERE pred].
+// Columns retains the plain column-name list for backwards compatibility; it
+// holds the ColName of each element and is empty in slots where the element is
+// an expression. Elems carries the full per-element detail (column or
+// expression). Where is the optional partial-index predicate.
 type IndexStmt struct {
 	Name    string
 	Table   string
 	Columns []string
+	Elems   []IndexElem
+	Where   Node
 	Unique  bool
 }
 
 func (*IndexStmt) nodeTag() NodeTag                       { return T_IndexStmt }
 func (*IndexStmt) walkChildren(fn func(Node) error) error { return nil }
 
-// DropStmt — DROP TABLE [IF EXISTS] name.
+// DropStmt — DROP TABLE [IF EXISTS] name, and other DROP statements.
 type DropStmt struct {
-	Table    string
-	IfExists bool
-	IsView   bool // DROP VIEW vs DROP TABLE
+	Table       string
+	IfExists    bool
+	IsView      bool // DROP VIEW vs DROP TABLE
+	IsSequence  bool // DROP SEQUENCE
+	IsSchema    bool // DROP SCHEMA
+	IsExtension bool // DROP EXTENSION
+	IsType      bool // DROP TYPE
 }
 
 func (*DropStmt) nodeTag() NodeTag                       { return T_DropStmt }
@@ -839,14 +1016,254 @@ type AlterTableKind int32
 const (
 	AlterAddColumn AlterTableKind = iota
 	AlterDropColumn
+	AlterRenameTable
+	AlterRenameColumn // RENAME COLUMN old TO new
+	// ALTER [COLUMN] colname ... actions:
+	AlterColumnType // ALTER COLUMN col TYPE typename [USING expr]
+	AlterSetDefault // ALTER COLUMN col SET DEFAULT expr
+	AlterDropDefault // ALTER COLUMN col DROP DEFAULT
+	AlterSetNotNull // ALTER COLUMN col SET NOT NULL
+	AlterDropNotNull // ALTER COLUMN col DROP NOT NULL
+	// ADD [CONSTRAINT name] PRIMARY KEY | UNIQUE | FOREIGN KEY | CHECK:
+	AlterAddConstraint
+	// ALTER TABLE ... { ENABLE | DISABLE | FORCE | NO FORCE } ROW LEVEL SECURITY:
+	AlterEnableRLS  // ENABLE ROW LEVEL SECURITY
+	AlterDisableRLS // DISABLE ROW LEVEL SECURITY
+	AlterForceRLS   // FORCE ROW LEVEL SECURITY
+	AlterNoForceRLS // NO FORCE ROW LEVEL SECURITY
 )
 
-// AlterTableStmt — ALTER TABLE name ADD COLUMN col type | DROP COLUMN col.
+// AlterTableCmd is a single action within an ALTER TABLE statement.
+// Subtype carries the action kind; Name is the existing object name (column,
+// constraint, etc.) and NewName is the target name for renames.
+type AlterTableCmd struct {
+	Subtype AlterTableKind
+	Name    string // existing column / constraint name
+	NewName string // target name for renames
+	// TypeName / UsingExpr carry ALTER COLUMN ... TYPE typename [USING expr].
+	TypeName  string
+	UsingExpr Node
+	// DefExpr carries the SET DEFAULT expression (AlterSetDefault).
+	DefExpr Node
+	// Constraint carries the detail for AlterAddConstraint.
+	Constraint *AlterTableConstraint
+}
+
+// ConstraintType classifies an ADD CONSTRAINT action.
+type ConstraintType int32
+
+const (
+	ConstrPrimaryKey ConstraintType = iota
+	ConstrUnique
+	ConstrForeignKey
+	ConstrCheck
+)
+
+// AlterTableConstraint carries the detail of an
+// ALTER TABLE ... ADD [CONSTRAINT name] { PRIMARY KEY | UNIQUE | FOREIGN KEY |
+// CHECK } clause.
+type AlterTableConstraint struct {
+	ConstraintType ConstraintType
+	Name           string   // optional CONSTRAINT name
+	Columns        []string // local columns (PK / UNIQUE / FK source columns)
+	// FOREIGN KEY targets:
+	RefTable   string
+	RefColumns []string
+	OnDelete   string // canonical referential action; "" if omitted
+	OnUpdate   string
+	// CHECK predicate:
+	Expr Node
+	// Deferrable / InitiallyDeferred carry [NOT] DEFERRABLE and
+	// INITIALLY { DEFERRED | IMMEDIATE } for a table-level / ADD CONSTRAINT
+	// constraint. The current grammar does not parse these for table-level
+	// constraints, so they remain false there (table-level FKs are
+	// non-deferrable); they are present so the executor reads deferrability
+	// uniformly across constraint paths.
+	Deferrable        bool
+	InitiallyDeferred bool
+}
+
+// AlterTableStmt — ALTER TABLE name ADD COLUMN col type | DROP COLUMN col |
+// RENAME TO name | RENAME COLUMN old TO new.
+//
+// The Cmds slice carries multi-action ALTER TABLE (used by the new grammar
+// rules). Single-action rules continue to populate the flat fields for
+// backwards compatibility with the executor.
 type AlterTableStmt struct {
-	Table  string
-	Kind   AlterTableKind
-	Column ColumnDef // for ADD: full def; for DROP: only ColName is set
+	Table   string
+	Kind    AlterTableKind
+	Column  ColumnDef      // for ADD: full def; for DROP: only ColName is set
+	NewName string         // for RENAME TO (table)
+	Cmds    []AlterTableCmd // populated by RENAME COLUMN / RENAME CONSTRAINT etc.
+	// Relation carries a *RangeVar when the grammar uses qualified_name
+	// (needed by the ALTER INDEX stub).
+	Relation *RangeVar
 }
 
 func (*AlterTableStmt) nodeTag() NodeTag                       { return T_AlterTableStmt }
 func (*AlterTableStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// SavepointStmt — SAVEPOINT name / RELEASE SAVEPOINT name / ROLLBACK TO name.
+type SavepointStmt struct {
+	Name     string
+	Release  bool // RELEASE SAVEPOINT
+	Rollback bool // ROLLBACK TO SAVEPOINT
+}
+
+func (*SavepointStmt) nodeTag() NodeTag                       { return T_SavepointStmt }
+func (*SavepointStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// CreateSeqStmt — CREATE [TEMP] SEQUENCE name [options].
+type CreateSeqStmt struct {
+	Sequence    *RangeVar
+	IfNotExists bool
+}
+
+func (*CreateSeqStmt) nodeTag() NodeTag                       { return T_CreateSeqStmt }
+func (*CreateSeqStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// CreateSchemaStmt — CREATE SCHEMA name.
+type CreateSchemaStmt struct {
+	SchemaName  string
+	IfNotExists bool
+}
+
+func (*CreateSchemaStmt) nodeTag() NodeTag                       { return T_CreateSchemaStmt }
+func (*CreateSchemaStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// CreateExtensionStmt — CREATE EXTENSION name.
+type CreateExtensionStmt struct {
+	ExtName     string
+	IfNotExists bool
+}
+
+func (*CreateExtensionStmt) nodeTag() NodeTag                       { return T_CreateExtensionStmt }
+func (*CreateExtensionStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// CreateEnumStmt — CREATE TYPE name AS ENUM (...).
+type CreateEnumStmt struct {
+	TypeName *RangeVar
+	Vals     []string
+}
+
+func (*CreateEnumStmt) nodeTag() NodeTag                       { return T_CreateEnumStmt }
+func (*CreateEnumStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// ListenStmt — LISTEN/NOTIFY/UNLISTEN channel.
+type ListenStmt struct {
+	Channel    string
+	IsNotify   bool
+	IsUnlisten bool
+	Payload    string
+}
+
+func (*ListenStmt) nodeTag() NodeTag                       { return T_ListenStmt }
+func (*ListenStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// DoNothingStmt is emitted for statements that BasuyuDB intentionally accepts
+// but does not execute (e.g. CREATE FUNCTION, CREATE TRIGGER, COMMENT ON …).
+// The executor returns a success result with Command "OK".
+type DoNothingStmt struct{}
+
+func (*DoNothingStmt) nodeTag() NodeTag                       { return T_DoNothingStmt }
+func (*DoNothingStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// ExplainStmt — EXPLAIN [ANALYZE] [VERBOSE] stmt.
+type ExplainStmt struct {
+	Query   Node
+	Analyze bool
+	Verbose bool
+}
+
+func (*ExplainStmt) nodeTag() NodeTag                       { return T_ExplainStmt }
+func (*ExplainStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// FieldSelect is composite-type field access: ( expr ).field. Arg is the row /
+// composite value expression; Field is the selected attribute name.
+type FieldSelect struct {
+	Arg   Node
+	Field string
+}
+
+func (*FieldSelect) nodeTag() NodeTag { return T_FieldSelect }
+func (f *FieldSelect) walkChildren(fn func(Node) error) error {
+	if f.Arg != nil {
+		return fn(f.Arg)
+	}
+	return nil
+}
+
+// CreatePolicyStmt — CREATE POLICY name ON table
+//   [AS { PERMISSIVE | RESTRICTIVE }]
+//   [FOR { ALL | SELECT | INSERT | UPDATE | DELETE }]
+//   [TO role_list] [USING (expr)] [WITH CHECK (expr)].
+type CreatePolicyStmt struct {
+	PolicyName string
+	Table      string
+	Permissive bool     // default true; RESTRICTIVE => false
+	Command    string   // "ALL" (default) / "SELECT" / "INSERT" / "UPDATE" / "DELETE"
+	Roles      []string // TO role_list; empty => PUBLIC
+	Using      Node     // USING (expr) predicate, or nil
+	WithCheck  Node     // WITH CHECK (expr) predicate, or nil
+}
+
+func (*CreatePolicyStmt) nodeTag() NodeTag { return T_CreatePolicyStmt }
+func (s *CreatePolicyStmt) walkChildren(fn func(Node) error) error {
+	if s.Using != nil {
+		if err := fn(s.Using); err != nil {
+			return err
+		}
+	}
+	if s.WithCheck != nil {
+		return fn(s.WithCheck)
+	}
+	return nil
+}
+
+// AlterPolicyStmt — ALTER POLICY name ON table [TO role_list]
+//   [USING (expr)] [WITH CHECK (expr)].
+type AlterPolicyStmt struct {
+	PolicyName string
+	Table      string
+	Roles      []string
+	Using      Node
+	WithCheck  Node
+}
+
+func (*AlterPolicyStmt) nodeTag() NodeTag { return T_AlterPolicyStmt }
+func (s *AlterPolicyStmt) walkChildren(fn func(Node) error) error {
+	if s.Using != nil {
+		if err := fn(s.Using); err != nil {
+			return err
+		}
+	}
+	if s.WithCheck != nil {
+		return fn(s.WithCheck)
+	}
+	return nil
+}
+
+// DropPolicyStmt — DROP POLICY [IF EXISTS] name ON table.
+type DropPolicyStmt struct {
+	PolicyName string
+	Table      string
+	IfExists   bool
+}
+
+func (*DropPolicyStmt) nodeTag() NodeTag                       { return T_DropPolicyStmt }
+func (*DropPolicyStmt) walkChildren(fn func(Node) error) error { return nil }
+
+// CompositeField is one field of a composite type body: name and SQL type name.
+type CompositeField struct {
+	Name     string
+	TypeName string
+}
+
+// CreateTypeStmt — CREATE TYPE name AS ( field type, ... ) (composite type).
+type CreateTypeStmt struct {
+	Name   string
+	Fields []CompositeField
+}
+
+func (*CreateTypeStmt) nodeTag() NodeTag                       { return T_CreateTypeStmt }
+func (*CreateTypeStmt) walkChildren(fn func(Node) error) error { return nil }

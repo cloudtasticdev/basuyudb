@@ -7,6 +7,7 @@ package session
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/auth"
 )
@@ -20,6 +21,11 @@ type Session struct {
 	connID uint64
 	params map[string]string // PG startup parameters (incl. "branch")
 	overrideBranch string // set via `SET branch = '...'` mid-session
+	// settings holds per-session run-time configuration parameters set via
+	// SET / set_config() — both standard GUCs and custom namespaced ones such as
+	// app.current_tenant. Keys are lowercased because PostgreSQL GUC names are
+	// case-insensitive. Read back by current_setting() / SHOW. nil until first set.
+	settings map[string]string
 }
 
 // New constructs a session from a validated auth.Session and the PG startup
@@ -70,4 +76,57 @@ func (s *Session) ConnID() uint64 { return s.connID }
 func (s *Session) Param(key string) (string, bool) {
 	v, ok := s.params[key]
 	return v, ok
+}
+
+// SetSetting persists a run-time configuration parameter (a GUC) for this
+// session. Used by SET and set_config(). GUC names are case-insensitive.
+func (s *Session) SetSetting(key, value string) {
+	if s.settings == nil {
+		s.settings = map[string]string{}
+	}
+	s.settings[strings.ToLower(strings.TrimSpace(key))] = value
+}
+
+// GetSetting returns a session GUC value and whether it was set. Names are
+// matched case-insensitively. Read by current_setting() and SHOW.
+func (s *Session) GetSetting(key string) (string, bool) {
+	if s.settings == nil {
+		return "", false
+	}
+	v, ok := s.settings[strings.ToLower(strings.TrimSpace(key))]
+	return v, ok
+}
+
+// ResetSetting clears a single session GUC (RESET name).
+func (s *Session) ResetSetting(key string) {
+	if s.settings == nil {
+		return
+	}
+	delete(s.settings, strings.ToLower(strings.TrimSpace(key)))
+}
+
+// ResetAllSettings clears every session GUC (RESET ALL / DISCARD ALL).
+func (s *Session) ResetAllSettings() { s.settings = nil }
+
+// User returns the authenticated user identity for current_user / session_user.
+// It prefers the PG startup "user" parameter (the role the client connected as,
+// which is what RLS policies compare against), then the auth token subject, and
+// falls back to "postgres" so RLS policies that compare against current_user
+// have a stable value on an unauthenticated single-node session.
+func (s *Session) User() string {
+	if u, ok := s.params["user"]; ok && u != "" {
+		return u
+	}
+	if s.Auth.Sub != "" {
+		return s.Auth.Sub
+	}
+	return "postgres"
+}
+
+// IsBypassRLS reports whether this session bypasses Row-Level Security entirely
+// (PostgreSQL: superusers and BYPASSRLS roles). The single-node engine treats an
+// "admin" auth role as the bypass identity. When the role is not "admin", RLS is
+// enforced — security is never silently skipped.
+func (s *Session) IsBypassRLS() bool {
+	return strings.EqualFold(s.Auth.Role, "admin")
 }

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/branch"
@@ -26,10 +27,12 @@ import (
 const (
 	OIDBool uint32 = 16
 	OIDBytea uint32 = 17
+	OIDChar uint32 = 18  // "char" — single-byte internal type (pg_type.typtype etc.)
 	OIDInt8 uint32 = 20
 	OIDInt2 uint32 = 21
 	OIDInt4 uint32 = 23
 	OIDText uint32 = 25
+	OIDOid uint32 = 26  // the oid type itself
 	OIDJSON uint32 = 114
 	OIDFloat4 uint32 = 700
 	OIDFloat8 uint32 = 701
@@ -41,8 +44,15 @@ const (
 	OIDTimestamptz uint32 = 1184
 	OIDNumeric uint32 = 1700
 	OIDUUID uint32 = 2950
+	OIDRecord uint32 = 2249 // anonymous composite / ROW(...) value
 	OIDJSONB uint32 = 3802
-	OIDUnknown uint32 = 705
+	OIDUnknown  uint32 = 705
+	OIDTextArr  uint32 = 1009 // text[] — array of text values
+	OIDInterval uint32 = 1186 // interval
+	OIDInt4Arr  uint32 = 1007 // int4[]
+	OIDInt8Arr  uint32 = 1016 // int8[]
+	OIDBoolArr  uint32 = 1000 // bool[]
+	OIDFloat8Arr uint32 = 1022 // float8[]
 )
 
 // Column describes a result column (name + PostgreSQL type OID).
@@ -90,8 +100,18 @@ type Executor interface {
 	// BeginExplicit / CommitExplicit / RollbackExplicit drive a multi-statement
 	// transaction for the wire layer's BEGIN / COMMIT / ROLLBACK.
 	BeginExplicit(ctx context.Context, sess *session.Session) (*transactions.Txn, error)
-	CommitExplicit(ctx context.Context, tx *transactions.Txn) error
+	// CommitExplicit runs any pending DEFERRABLE constraint checks for tx and, if
+	// they pass, commits. A deferred FK violation (23503) aborts the commit. sess
+	// supplies the namespace/branch the deferred checks run against.
+	CommitExplicit(ctx context.Context, tx *transactions.Txn, sess *session.Session) error
 	RollbackExplicit(ctx context.Context, tx *transactions.Txn) error
+
+	// SetConstraints implements SET CONSTRAINTS { ALL | name [, ...] }
+	// { DEFERRED | IMMEDIATE } for the explicit transaction tx (the wire layer's
+	// active BEGIN block; nil in autocommit, where it is a no-op). Setting a
+	// DEFERRABLE constraint IMMEDIATE re-checks any of its pending deferred
+	// violations and returns the FK error (23503) if one now fails.
+	SetConstraints(ctx context.Context, tx *transactions.Txn, sess *session.Session, all bool, names []string, deferred bool) error
 
 	// SweepOTelRetention deletes otel_spans older than cutoff (RFC3339), for a
 	// background retention job. Returns the number removed.
@@ -105,12 +125,21 @@ type Executor interface {
 	// honoring defaults and constraints. Returns the number of rows loaded.
 	CopyFrom(ctx context.Context, sess *session.Session, table string, columns []string, rows [][]Datum) (int64, error)
 
+	// CopyTargetOIDs returns the type OIDs of the COPY target columns (or all
+	// table columns when columns is empty), used to decode binary COPY FROM.
+	CopyTargetOIDs(ctx context.Context, sess *session.Session, table string, columns []string) ([]uint32, error)
+
 	// DescribeReturning returns the result columns of an INSERT/UPDATE/DELETE
 	// ... RETURNING prepared statement, resolved from the table schema WITHOUT
 	// executing (no rows are mutated). ok is false when stmt has no RETURNING.
 	// Needed by the extended-protocol Describe path, where executing to learn
 	// the columns would be a side effect.
 	DescribeReturning(ctx context.Context, stmt ast.Node, sess *session.Session) (cols []Column, ok bool, err error)
+
+	// InferColumns derives the result-column descriptors of a SELECT statement
+	// purely from the schema, without executing it. Used by the Describe path when
+	// normal execution fails (e.g. unsupported WHERE syntax like = ANY($1)).
+	InferColumns(ctx context.Context, sess *session.Session, sel *ast.SelectStmt) []Column
 }
 
 // New constructs the canonical executor over a managed Store and the
@@ -124,6 +153,10 @@ type execImpl struct {
 	store storage.Store
 	txn transactions.TransactionEngine
 	branches *branch.Manager
+	// deferred holds per-transaction DEFERRABLE constraint state (SET CONSTRAINTS
+	// overrides and pending deferred FK checks), keyed by the explicit
+	// *transactions.Txn pointer. See deferred.go.
+	deferred deferredRegistry
 }
 
 func (e *execImpl) Execute(ctx context.Context, stmt ast.Node, sess *session.Session, params []Datum) (*Result, error) {
@@ -156,6 +189,9 @@ func (e *execImpl) executeOnce(ctx context.Context, stmt ast.Node, sess *session
 	case *ast.SelectStmt:
 		return e.execSelect(ctx, s, sess, params)
 	case *ast.CreateStmt:
+		if s.AsSelect != nil {
+			return e.execCreateTableAs(ctx, s, sess, params)
+		}
 		return e.execCreateTable(ctx, s, sess)
 	case *ast.CreateViewStmt:
 		return e.execCreateView(ctx, s, sess)
@@ -165,11 +201,25 @@ func (e *execImpl) executeOnce(ctx context.Context, stmt ast.Node, sess *session
 		if s.IsView {
 			return e.execDropView(ctx, s, sess)
 		}
+		if s.IsSequence {
+			return e.execDropSequence(ctx, s, sess)
+		}
+		if s.IsSchema || s.IsExtension || s.IsType {
+			return &Result{Command: "DROP"}, nil
+		}
 		return e.execDropTable(ctx, s, sess)
 	case *ast.TruncateStmt:
 		return e.execTruncate(ctx, s, sess)
+	case *ast.ShowStmt:
+		return e.execShow(ctx, s, sess)
 	case *ast.AlterTableStmt:
 		return e.execAlterTable(ctx, s, sess)
+	case *ast.CreatePolicyStmt:
+		return e.execCreatePolicy(ctx, s, sess)
+	case *ast.AlterPolicyStmt:
+		return e.execAlterPolicy(ctx, s, sess)
+	case *ast.DropPolicyStmt:
+		return e.execDropPolicy(ctx, s, sess)
 	case *ast.InsertStmt:
 		return e.execInsert(ctx, s, sess, params)
 	case *ast.UpdateStmt:
@@ -182,6 +232,45 @@ func (e *execImpl) executeOnce(ctx context.Context, stmt ast.Node, sess *session
 		return e.execMergeBranch(ctx, s, sess)
 	case *ast.DropBranchStmt:
 		return e.execDropBranch(ctx, s, sess)
+	case *ast.SavepointStmt:
+		if s.Release {
+			return &Result{Command: "RELEASE"}, nil
+		}
+		if s.Rollback {
+			return &Result{Command: "ROLLBACK"}, nil
+		}
+		if s.Name == "vacuum" {
+			return &Result{Command: "VACUUM"}, nil
+		}
+		if s.Name == "analyze" {
+			return &Result{Command: "ANALYZE"}, nil
+		}
+		if s.Name == "reindex" {
+			return &Result{Command: "REINDEX"}, nil
+		}
+		return &Result{Command: "SAVEPOINT"}, nil
+	case *ast.CreateSeqStmt:
+		return e.execCreateSequence(ctx, s, sess)
+	case *ast.CreateSchemaStmt:
+		return &Result{Command: "CREATE SCHEMA"}, nil
+	case *ast.CreateExtensionStmt:
+		return &Result{Command: "CREATE EXTENSION"}, nil
+	case *ast.CreateEnumStmt:
+		return e.execCreateEnum(ctx, s, sess)
+	case *ast.CreateTypeStmt:
+		return e.execCreateType(ctx, s, sess)
+	case *ast.ListenStmt:
+		if s.IsNotify {
+			return &Result{Command: "NOTIFY"}, nil
+		}
+		if s.IsUnlisten {
+			return &Result{Command: "UNLISTEN"}, nil
+		}
+		return &Result{Command: "LISTEN"}, nil
+	case *ast.DoNothingStmt:
+		return &Result{Command: "OK"}, nil
+	case *ast.ExplainStmt:
+		return e.execExplain(ctx, s, sess, params)
 	default:
 		return nil, newExecError("0A000", "unsupported statement type %T", stmt)
 	}
@@ -206,7 +295,39 @@ func (e *execImpl) execSelect(ctx context.Context, s *ast.SelectStmt, sess *sess
 		return e.execSelectFrom(ctx, s, sess, params)
 	}
 
-	ev := &evaluator{params: params}
+	// FROM-less SELECT: still allow scalar / EXISTS subqueries in the target list.
+	// sess is threaded so current_setting / set_config / current_user resolve
+	// against the session (e.g. SELECT set_config('app.tenant', 't1', false)).
+	ev := &evaluator{params: params, sess: sess, lookupComposite: e.compositeResolverCtx(ctx, sess), runSub: func(sel *ast.SelectStmt) (*Result, error) {
+		return e.execSelect(ctx, sel, sess, params)
+	}}
+
+	// Set-returning function in the SELECT list (e.g. SELECT unnest(ARRAY[1,2,3]))
+	// expands to one row per element. Handle the common single-SRF-target case.
+	if srf, idx := singleSRFTarget(s.TargetList); srf != nil {
+		elems, _, err := ev.srfElements(srf)
+		if err != nil {
+			return nil, err
+		}
+		name := s.TargetList[idx].Name
+		if name == "" {
+			name = defaultColName(srf, idx)
+		}
+		colOID := OIDText
+		if len(elems) > 0 {
+			colOID = elems[0].oid
+		}
+		outRows := make([][]Datum, 0, len(elems))
+		for _, el := range elems {
+			outRows = append(outRows, []Datum{{Null: el.null, Text: el.text}})
+		}
+		return &Result{
+			Columns: []Column{{Name: name, TypeOID: colOID}},
+			Rows:    outRows,
+			Command: "SELECT",
+		}, nil
+	}
+
 	cols := make([]Column, 0, len(s.TargetList))
 	row := make([]Datum, 0, len(s.TargetList))
 
@@ -228,6 +349,22 @@ func (e *execImpl) execSelect(ctx context.Context, s *ast.SelectStmt, sess *sess
 		Rows: [][]Datum{row},
 		Command: "SELECT",
 	}, nil
+}
+
+// singleSRFTarget returns the lone set-returning FuncCall target and its index
+// when the target list is exactly one SRF call; otherwise nil. This is the
+// common app pattern (SELECT unnest(...), SELECT jsonb_array_elements(...)).
+func singleSRFTarget(targets []*ast.ResTarget) (*ast.FuncCall, int) {
+	if len(targets) != 1 {
+		return nil, -1
+	}
+	if fc, ok := targets[0].Val.(*ast.FuncCall); ok && fc.Over == nil {
+		name := strings.ToLower(strings.Join(fc.FuncName, "."))
+		if isSRFName(name) {
+			return fc, 0
+		}
+	}
+	return nil, -1
 }
 
 // defaultColName mirrors PostgreSQL's unnamed-column behaviour: a bare column

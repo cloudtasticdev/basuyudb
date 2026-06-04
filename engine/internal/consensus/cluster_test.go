@@ -17,9 +17,9 @@ import (
 func TestThreeNodeReplicationAndFailover(t *testing.T) {
 	const shard = 1
 	addrs := map[uint64]string{
-		1: "127.0.0.1:63021",
-		2: "127.0.0.1:63022",
-		3: "127.0.0.1:63023",
+		1: freeAddr(t),
+		2: freeAddr(t),
+		3: freeAddr(t),
 	}
 
 	type member struct {

@@ -132,6 +132,46 @@ func TestPgxExtendedProtocol(t *testing.T) {
 	}
 }
 
+// TestPgxNamedStatementCaching exercises pgx's DEFAULT exec mode
+// (QueryExecModeCacheStatement) — named server-side prepared statements. It
+// interleaves several distinct prepared statements (the pattern that previously
+// collided on a single statement slot) to prove named statements + portals work.
+func TestPgxNamedStatementCaching(t *testing.T) {
+	addr := startTestServer(t)
+	ctx := context.Background()
+	conn := pgxConnect(t, addr, false) // default mode = cache (named) statements
+	defer conn.Close(ctx)
+
+	if _, err := conn.Exec(ctx, "CREATE TABLE acct (id INT PRIMARY KEY, bal INT)"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := conn.Exec(ctx, "INSERT INTO acct (id, bal) VALUES ($1, $2)", 1, 100); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Run the loop multiple times: pgx caches each unique SQL as a named statement
+	// after the first use, so later iterations Bind/Execute without re-Parse.
+	for i := 0; i < 5; i++ {
+		var bal int
+		if err := conn.QueryRow(ctx, "SELECT bal FROM acct WHERE id = $1", 1).Scan(&bal); err != nil {
+			t.Fatalf("select (iter %d): %v", i, err)
+		}
+		// Distinct prepared statement with params in BOTH the SET and the WHERE —
+		// the exact shape that previously failed with "$2 out of range".
+		if _, err := conn.Exec(ctx, "UPDATE acct SET bal = $1 WHERE id = $2", bal+10, 1); err != nil {
+			t.Fatalf("update (iter %d): %v", i, err)
+		}
+	}
+
+	var bal int
+	if err := conn.QueryRow(ctx, "SELECT bal FROM acct WHERE id = 1").Scan(&bal); err != nil {
+		t.Fatalf("final select: %v", err)
+	}
+	if bal != 150 {
+		t.Fatalf("named-statement caching: want bal=150, got %d", bal)
+	}
+}
+
 // TestPgxTypedColumns proves the binary result encoders for the richer types
 // (smallint, timestamp) round-trip through pgx's extended protocol, which
 // requests binary for these OIDs.

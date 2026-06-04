@@ -132,3 +132,170 @@ func TestCreateTableColumns(t *testing.T) {
 		t.Fatalf("col 1 should be name NOT NULL, got %#v", c.TableElts[1])
 	}
 }
+
+// TestRowLevelSecurityDDL verifies CREATE/ALTER/DROP POLICY and ALTER TABLE ...
+// ROW LEVEL SECURITY parse into the expected AST shapes.
+func TestRowLevelSecurityDDL(t *testing.T) {
+	n, err := Parse("CREATE POLICY p ON docs AS RESTRICTIVE FOR SELECT TO alice, bob USING (owner = current_user) WITH CHECK (owner = current_user)")
+	if err != nil {
+		t.Fatalf("create policy: %v", err)
+	}
+	cp, ok := n.(*ast.CreatePolicyStmt)
+	if !ok {
+		t.Fatalf("want *CreatePolicyStmt, got %T", n)
+	}
+	if cp.PolicyName != "p" || cp.Table != "docs" || cp.Permissive || cp.Command != "SELECT" {
+		t.Fatalf("create policy fields wrong: %#v", cp)
+	}
+	if len(cp.Roles) != 2 || cp.Roles[0] != "alice" || cp.Roles[1] != "bob" {
+		t.Fatalf("roles wrong: %#v", cp.Roles)
+	}
+	if cp.Using == nil || cp.WithCheck == nil {
+		t.Fatalf("using/check missing: %#v", cp)
+	}
+
+	// Default permissive + command ALL.
+	n2, err := Parse("CREATE POLICY p2 ON docs USING (true)")
+	if err != nil {
+		t.Fatalf("create policy defaults: %v", err)
+	}
+	cp2 := n2.(*ast.CreatePolicyStmt)
+	if !cp2.Permissive || cp2.Command != "ALL" {
+		t.Fatalf("defaults wrong: %#v", cp2)
+	}
+
+	if n, err := Parse("ALTER POLICY p ON docs TO alice USING (true)"); err != nil {
+		t.Fatalf("alter policy: %v", err)
+	} else if _, ok := n.(*ast.AlterPolicyStmt); !ok {
+		t.Fatalf("want *AlterPolicyStmt, got %T", n)
+	}
+
+	if n, err := Parse("DROP POLICY IF EXISTS p ON docs"); err != nil {
+		t.Fatalf("drop policy: %v", err)
+	} else if dp, ok := n.(*ast.DropPolicyStmt); !ok || !dp.IfExists || dp.PolicyName != "p" || dp.Table != "docs" {
+		t.Fatalf("drop policy wrong: %#v", n)
+	}
+
+	rls := []struct {
+		sql  string
+		kind ast.AlterTableKind
+	}{
+		{"ALTER TABLE docs ENABLE ROW LEVEL SECURITY", ast.AlterEnableRLS},
+		{"ALTER TABLE docs DISABLE ROW LEVEL SECURITY", ast.AlterDisableRLS},
+		{"ALTER TABLE docs FORCE ROW LEVEL SECURITY", ast.AlterForceRLS},
+		{"ALTER TABLE docs NO FORCE ROW LEVEL SECURITY", ast.AlterNoForceRLS},
+	}
+	for _, c := range rls {
+		n, err := Parse(c.sql)
+		if err != nil {
+			t.Fatalf("%q: %v", c.sql, err)
+		}
+		at, ok := n.(*ast.AlterTableStmt)
+		if !ok || at.Kind != c.kind {
+			t.Fatalf("%q: want kind %d, got %#v", c.sql, c.kind, n)
+		}
+	}
+}
+
+// TestTableConstraints verifies table-level constraints in CREATE TABLE.
+func TestTableConstraints(t *testing.T) {
+	sql := "CREATE TABLE t (" +
+		"a int, b int, " +
+		"CONSTRAINT pk PRIMARY KEY (a, b), " +
+		"UNIQUE (b), " +
+		"FOREIGN KEY (a) REFERENCES parent (id) ON DELETE CASCADE, " +
+		"CHECK (a > 0))"
+	n, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c := n.(*ast.CreateStmt)
+	if len(c.TableElts) != 2 {
+		t.Fatalf("want 2 columns, got %d", len(c.TableElts))
+	}
+	if len(c.TableConstraints) != 4 {
+		t.Fatalf("want 4 table constraints, got %d", len(c.TableConstraints))
+	}
+	pk := c.TableConstraints[0]
+	if pk.ConstraintType != ast.ConstrPrimaryKey || pk.Name != "pk" || len(pk.Columns) != 2 {
+		t.Fatalf("pk wrong: %#v", pk)
+	}
+	fk := c.TableConstraints[2]
+	if fk.ConstraintType != ast.ConstrForeignKey || fk.RefTable != "parent" || fk.OnDelete != "CASCADE" {
+		t.Fatalf("fk wrong: %#v", fk)
+	}
+}
+
+// TestTableConstraintDeferrable verifies the trailing [NOT] DEFERRABLE /
+// INITIALLY clause on table-level constraints and ALTER TABLE ADD CONSTRAINT.
+func TestTableConstraintDeferrable(t *testing.T) {
+	n, err := Parse("CREATE TABLE c (a int, b int, " +
+		"FOREIGN KEY (a) REFERENCES p(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)")
+	if err != nil {
+		t.Fatalf("parse create: %v", err)
+	}
+	c := n.(*ast.CreateStmt)
+	if len(c.TableConstraints) != 1 {
+		t.Fatalf("want 1 table constraint, got %d", len(c.TableConstraints))
+	}
+	fk := c.TableConstraints[0]
+	if fk.ConstraintType != ast.ConstrForeignKey || fk.RefTable != "p" || fk.OnDelete != "CASCADE" {
+		t.Fatalf("fk basics wrong: %#v", fk)
+	}
+	if !fk.Deferrable || !fk.InitiallyDeferred {
+		t.Fatalf("want Deferrable && InitiallyDeferred, got Deferrable=%v InitiallyDeferred=%v",
+			fk.Deferrable, fk.InitiallyDeferred)
+	}
+
+	n2, err := Parse("ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p(id) DEFERRABLE")
+	if err != nil {
+		t.Fatalf("parse alter: %v", err)
+	}
+	at := n2.(*ast.AlterTableStmt)
+	if len(at.Cmds) != 1 || at.Cmds[0].Constraint == nil {
+		t.Fatalf("want 1 add-constraint cmd, got %#v", at.Cmds)
+	}
+	con := at.Cmds[0].Constraint
+	if con.ConstraintType != ast.ConstrForeignKey || con.Name != "fk" || con.RefTable != "p" {
+		t.Fatalf("alter fk basics wrong: %#v", con)
+	}
+	if !con.Deferrable || con.InitiallyDeferred {
+		t.Fatalf("want Deferrable && !InitiallyDeferred, got Deferrable=%v InitiallyDeferred=%v",
+			con.Deferrable, con.InitiallyDeferred)
+	}
+}
+
+// TestFieldSelectAndCompositeType verifies (expr).field access and CREATE TYPE
+// composite parse correctly.
+func TestFieldSelectAndCompositeType(t *testing.T) {
+	n, err := Parse("SELECT (ROW(1, 2)).f1")
+	if err != nil {
+		t.Fatalf("field select: %v", err)
+	}
+	sel := n.(*ast.SelectStmt)
+	fs, ok := sel.TargetList[0].Val.(*ast.FieldSelect)
+	if !ok || fs.Field != "f1" {
+		t.Fatalf("want FieldSelect f1, got %#v", sel.TargetList[0].Val)
+	}
+
+	n2, err := Parse("CREATE TYPE pt AS (x int, y int)")
+	if err != nil {
+		t.Fatalf("create type composite: %v", err)
+	}
+	ct, ok := n2.(*ast.CreateTypeStmt)
+	if !ok || ct.Name != "pt" || len(ct.Fields) != 2 {
+		t.Fatalf("want CreateTypeStmt pt with 2 fields, got %#v", n2)
+	}
+	if ct.Fields[0].Name != "x" || ct.Fields[0].TypeName != "int" {
+		t.Fatalf("field 0 wrong: %#v", ct.Fields[0])
+	}
+
+	// CREATE TYPE AS ENUM must still build CreateEnumStmt.
+	n3, err := Parse("CREATE TYPE mood AS ENUM ('happy', 'sad')")
+	if err != nil {
+		t.Fatalf("create type enum: %v", err)
+	}
+	if _, ok := n3.(*ast.CreateEnumStmt); !ok {
+		t.Fatalf("want CreateEnumStmt, got %T", n3)
+	}
+}

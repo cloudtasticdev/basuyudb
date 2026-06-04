@@ -139,6 +139,32 @@ func (e *execImpl) nextSequenceVal(ctx context.Context, txn *transactions.Txn, s
 	return next, nil
 }
 
+// applyGeneratedColumns recomputes every GENERATED ALWAYS AS (expr) STORED
+// column from the other cells of the row. Any user-supplied value is overwritten
+// (PostgreSQL forbids supplying one; recomputing is the safe, lossless choice).
+// Called on INSERT and UPDATE after defaults are materialized. The generation
+// expression may reference sibling columns but not other generated columns'
+// freshly computed values in a defined order — we evaluate left-to-right so a
+// later generated column can read an earlier one's new value.
+func (e *execImpl) applyGeneratedColumns(sch *tableSchema, table string, cells []Datum, params []Datum) error {
+	for i, c := range sch.Cols {
+		if !c.Generated || c.GeneratedExpr == "" {
+			continue
+		}
+		node, err := parseStoredExpr(c.GeneratedExpr)
+		if err != nil {
+			return err
+		}
+		ev := &evaluator{params: params, resolveCol: rowResolver(sch, table, cells)}
+		v, err := ev.eval(node)
+		if err != nil {
+			return err
+		}
+		cells[i] = Datum{Null: v.null, Text: v.text}
+	}
+	return nil
+}
+
 // randomUUIDv4 returns a random RFC-4122 v4 UUID string.
 func randomUUIDv4() (string, error) {
 	var b [16]byte

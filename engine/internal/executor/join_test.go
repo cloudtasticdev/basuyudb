@@ -63,6 +63,79 @@ func TestJSONBExtraction(t *testing.T) {
 	}
 }
 
+// TestRightJoin verifies RIGHT OUTER JOIN emits NULL-filled left columns for
+// unmatched right rows.
+func TestRightJoin(t *testing.T) {
+	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
+	defer st.Close()
+	ex := New(st, transactions.New(st, 1, nil))
+	sess := testSession(t)
+
+	run(t, ex, sess, "CREATE TABLE a (id text PRIMARY KEY)")
+	run(t, ex, sess, "CREATE TABLE b (id text PRIMARY KEY, a_id text)")
+	run(t, ex, sess, "INSERT INTO b (id, a_id) VALUES ('b1', 'a1')")
+	// no matching a row
+
+	res := run(t, ex, sess, "SELECT a.id, b.id FROM a RIGHT JOIN b ON a.id = b.a_id")
+	if len(res.Rows) != 1 {
+		t.Fatalf("want 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if !res.Rows[0][0].Null || res.Rows[0][1].Text != "b1" {
+		t.Fatalf("want (NULL, b1), got (null=%v, %q)", res.Rows[0][0].Null, res.Rows[0][1].Text)
+	}
+}
+
+// TestFullOuterJoin verifies FULL OUTER JOIN emits all rows from both sides,
+// NULL-filling the missing side.
+func TestFullOuterJoin(t *testing.T) {
+	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
+	defer st.Close()
+	ex := New(st, transactions.New(st, 1, nil))
+	sess := testSession(t)
+
+	run(t, ex, sess, "CREATE TABLE a (id text PRIMARY KEY)")
+	run(t, ex, sess, "CREATE TABLE b (id text PRIMARY KEY, a_id text)")
+	run(t, ex, sess, "INSERT INTO a (id) VALUES ('a1')")
+	run(t, ex, sess, "INSERT INTO a (id) VALUES ('a2')")
+	run(t, ex, sess, "INSERT INTO b (id, a_id) VALUES ('b1', 'a1')")
+	run(t, ex, sess, "INSERT INTO b (id, a_id) VALUES ('b2', 'a99')") // unmatched right
+
+	res := run(t, ex, sess, "SELECT a.id, b.id FROM a FULL JOIN b ON a.id = b.a_id")
+	if len(res.Rows) != 3 {
+		// Expected: (a1,b1), (a2,NULL), (NULL,b2)
+		t.Fatalf("want 3 rows (a1/b1 match, a2 unmatched left, b2 unmatched right), got %d: %#v", len(res.Rows), res.Rows)
+	}
+}
+
+// TestGenerateSeries verifies generate_series as a table-valued function.
+func TestGenerateSeries(t *testing.T) {
+	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})
+	defer st.Close()
+	ex := New(st, transactions.New(st, 1, nil))
+	sess := testSession(t)
+
+	// Basic range 1..5
+	res := run(t, ex, sess, "SELECT generate_series FROM generate_series(1, 5)")
+	if len(res.Rows) != 5 {
+		t.Fatalf("want 5 rows, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if res.Rows[0][0].Text != "1" || res.Rows[4][0].Text != "5" {
+		t.Fatalf("unexpected values: first=%q last=%q", res.Rows[0][0].Text, res.Rows[4][0].Text)
+	}
+
+	// Step=2
+	res = run(t, ex, sess, "SELECT generate_series FROM generate_series(0, 6, 2)")
+	if len(res.Rows) != 4 { // 0,2,4,6
+		t.Fatalf("want 4 rows (step 2), got %d: %#v", len(res.Rows), res.Rows)
+	}
+
+	// Alias
+	res = run(t, ex, sess, "SELECT n FROM generate_series(1, 3) AS gs(n)")
+	if len(res.Rows) != 3 {
+		t.Fatalf("want 3 rows with alias, got %d", len(res.Rows))
+	}
+}
+
 // TestLeftJoinNullFill verifies LEFT JOIN emits NULL-filled right columns.
 func TestLeftJoinNullFill(t *testing.T) {
 	st, _ := storage.Open(storage.Options{DataDir: t.TempDir(), ValueLogFileMB: 4})

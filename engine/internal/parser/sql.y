@@ -31,9 +31,19 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 	jt ast.JoinType
 	boolVal bool
 	onConflict *ast.OnConflictClause
+	distinct distinctClause
+	indexElems []ast.IndexElem
+	indexElem ast.IndexElem
+	alterCmd ast.AlterTableCmd
+	alterConstraint *ast.AlterTableConstraint
+	tableElem tableElement
+	tableElems tableElementList
+	compositeField ast.CompositeField
+	compositeFields []ast.CompositeField
+	strList []string
 }
 
-%token <str> IDENT SCONST ICONST FCONST OP COMPARE_OP ADD_OP MUL_OP JSON_OP VECTOR_OP STAR
+%token <str> IDENT SCONST ICONST FCONST OP COMPARE_OP ADD_OP MUL_OP JSON_OP VECTOR_OP STAR POW_OP CONTAIN_OP
 %token <ival> PARAM
 %token SELECT FROM WHERE AS JOIN INNER LEFT RIGHT FULL CROSS ON USING
 %token AND OR NOT NULL IS ORDER BY ASC DESC GROUP HAVING LIMIT OFFSET
@@ -46,12 +56,28 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %token REFERENCES CHECK FOREIGN
 %token WITH OVER PARTITION VIEW REPLACE
 %token COPY TO STDIN STDOUT FORMAT DELIMITER HEADER
+%token SHOW CAST
+%token SAVEPOINT RELEASE LATERAL
+%token SEQUENCE EXTENSION SCHEMA LISTEN NOTIFY UNLISTEN ENUM TYPE
+%token FOR SHARE NOWAIT SKIP LOCKED
+%token START INCREMENT MINVALUE MAXVALUE CYCLE CACHE OWNED AUTHORIZATION
+%token NO VACUUM ANALYSE REINDEX
+%token ARRAY INTERVAL TEMP TEMPORARY RENAME
+%token CONSTRAINT
+%token RECURSIVE EXPLAIN VERBOSE FILTER WITHIN
+%token MATERIALIZED REFRESH CONCURRENTLY
+%token ROLLUP CUBE GROUPING SETS
+%token FETCH FIRST NEXT ROWS ROW ONLY
+%token SIMILAR
+%token DEFERRABLE INITIALLY DEFERRED IMMEDIATE NOT_DEFERRABLE
+%token GENERATED ALWAYS IDENTITY STORED ACTION CASCADE RESTRICT
+%token POLICY PERMISSIVE RESTRICTIVE FORCE LEVEL SECURITY ENABLE DISABLE
 
 %type <node> stmt select_stmt select_core insert_stmt update_stmt delete_stmt create_stmt create_index_stmt copy_stmt
-%type <node> drop_table_stmt truncate_stmt alter_table_stmt
+%type <node> drop_table_stmt truncate_stmt alter_table_stmt show_stmt do_nothing_stmt
 %type <node> create_branch_stmt merge_branch_stmt drop_branch_stmt
 %type <node> expr table_ref from_item where_opt having_opt limit_opt offset_opt
-%type <nodes> from_clause from_list expr_list group_opt insert_values
+%type <nodes> from_clause from_list expr_list group_opt insert_values insert_row_list grouping_set_list grouping_set
 %type <node> insert_value
 %type <resTargets> target_list set_list returning_opt
 %type <onConflict> on_conflict_opt
@@ -60,9 +86,8 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %type <sortList> order_opt sort_list
 %type <sortBy> sort_el
 %type <strs> name_list insert_cols_opt
-%type <colDefs> col_def_list
 %type <colDef> col_def
-%type <colQual> col_qual
+%type <colQual> col_qual col_qual_body con_deferral_opt
 %type <colQuals> col_qual_list col_qual_list_opt
 %type <node> case_expr case_arg_opt case_else_opt
 %type <caseWhen> case_when
@@ -76,7 +101,28 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %type <strs> copy_cols_opt
 %type <str> typename type_words cast_type
 %type <jt> join_type
-%type <boolVal> distinct_opt set_all_opt
+%type <distinct> distinct_opt
+%type <boolVal> set_all_opt for_update_clause_opt
+%type <str> ref_action
+%type <colQual> ref_actions_opt
+%type <indexElems> index_elem_list
+%type <indexElem> index_elem
+%type <node> index_where_opt
+%type <alterCmd> alter_col_action
+%type <alterConstraint> add_constraint
+%type <str> constraint_name_opt
+%type <node> savepoint_stmt release_savepoint_stmt create_seq_stmt create_schema_stmt create_extension_stmt create_type_stmt listen_stmt notify_stmt unlisten_stmt vacuum_stmt explain_stmt
+%type <strs> enum_val_list
+%type <node> create_policy_stmt alter_policy_stmt drop_policy_stmt
+%type <boolVal> policy_permissive_opt
+%type <str> policy_command_opt
+%type <strs> policy_to_opt role_list
+%type <node> policy_using_opt policy_check_opt
+%type <tableElem> table_elem
+%type <tableElems> table_elem_list
+%type <alterConstraint> table_constraint
+%type <compositeFields> composite_attr_list
+%type <compositeField> composite_attr
 
 %left UNION EXCEPT
 %left INTERSECT
@@ -85,10 +131,11 @@ import "github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 %right NOT
 %nonassoc IS
 %nonassoc IN
-%left COMPARE_OP
+%left COMPARE_OP CONTAIN_OP
 %left VECTOR_OP
 %left ADD_OP
 %left STAR MUL_OP
+%right POW_OP
 %left JSON_OP
 %right TYPECAST
 %right UMINUS
@@ -124,12 +171,28 @@ stmt:
 	| merge_branch_stmt { $$ = $1 }
 	| drop_branch_stmt { $$ = $1 }
 	| copy_stmt { $$ = $1 }
+	| show_stmt { $$ = $1 }
+	| savepoint_stmt { $$ = $1 }
+	| release_savepoint_stmt { $$ = $1 }
+	| create_seq_stmt { $$ = $1 }
+	| create_schema_stmt { $$ = $1 }
+	| create_extension_stmt { $$ = $1 }
+	| create_type_stmt { $$ = $1 }
+	| listen_stmt { $$ = $1 }
+	| notify_stmt { $$ = $1 }
+	| unlisten_stmt { $$ = $1 }
+	| vacuum_stmt { $$ = $1 }
+	| explain_stmt { $$ = $1 }
+	| create_policy_stmt { $$ = $1 }
+	| alter_policy_stmt { $$ = $1 }
+	| drop_policy_stmt { $$ = $1 }
+	| do_nothing_stmt { $$ = $1 }
 
 /* ----- SELECT ----- */
 /* select_stmt is a (possibly set-op) select_core with trailing ORDER BY / LIMIT
    / OFFSET that apply to the whole result. */
 select_stmt:
-	with_clause_opt select_core order_opt limit_opt offset_opt
+	with_clause_opt select_core order_opt limit_opt offset_opt for_update_clause_opt
 		{
 			sel := $2.(*ast.SelectStmt)
 			sel.WithClause = $1
@@ -142,7 +205,9 @@ select_stmt:
 with_clause_opt:
 		{ $$ = nil }
 	| WITH cte_list
-		{ $$ = &ast.WithClause{CTEs: $2} }
+		{ $$ = &ast.WithClause{CTEs: $2, Recursive: false} }
+	| WITH RECURSIVE cte_list
+		{ $$ = &ast.WithClause{CTEs: $3, Recursive: true} }
 
 cte_list:
 	common_table_expr
@@ -153,6 +218,8 @@ cte_list:
 common_table_expr:
 	IDENT AS '(' select_stmt ')'
 		{ $$ = &ast.CommonTableExpr{Name: $1, Query: $4} }
+	| IDENT '(' name_list ')' AS '(' select_stmt ')'
+		{ $$ = &ast.CommonTableExpr{Name: $1, Cols: $3, Query: $7} }
 
 /* OVER ( [PARTITION BY ...] [ORDER BY ...] ) */
 window_spec:
@@ -168,7 +235,8 @@ select_core:
 	SELECT distinct_opt target_list from_clause where_opt group_opt having_opt
 		{
 			$$ = &ast.SelectStmt{
-				Distinct: $2,
+				Distinct: $2.distinct,
+				DistinctOn: $2.on,
 				TargetList: $3,
 				FromClause: $4,
 				WhereClause: $5,
@@ -191,9 +259,11 @@ set_all_opt:
 		{ $$ = false }
 
 distinct_opt:
-		{ $$ = false }
+		{ $$ = distinctClause{} }
 	| DISTINCT
-		{ $$ = true }
+		{ $$ = distinctClause{distinct: true} }
+	| DISTINCT ON '(' expr_list ')'
+		{ $$ = distinctClause{distinct: true, on: $4} }
 
 target_list:
 	target_el
@@ -250,6 +320,50 @@ table_ref:
 		{ $1.Alias = &ast.Alias{AliasName: $2}; $$ = $1 }
 	| qualified_name AS IDENT
 		{ $1.Alias = &ast.Alias{AliasName: $3}; $$ = $1 }
+	| '(' select_stmt ')' IDENT
+		{ $$ = &ast.SubLink{SubSelect: $2, Alias: &ast.Alias{AliasName: $4}} }
+	| '(' select_stmt ')' AS IDENT
+		{ $$ = &ast.SubLink{SubSelect: $2, Alias: &ast.Alias{AliasName: $5}} }
+	| LATERAL '(' select_stmt ')' AS IDENT
+		{
+			$$ = &ast.RangeSubselect{
+				Subquery: $3,
+				Alias: &ast.Alias{AliasName: $6},
+				Lateral: true,
+			}
+		}
+	| LATERAL '(' select_stmt ')' IDENT
+		{
+			$$ = &ast.RangeSubselect{
+				Subquery: $3,
+				Alias: &ast.Alias{AliasName: $5},
+				Lateral: true,
+			}
+		}
+	| LATERAL '(' select_stmt ')'
+		{
+			$$ = &ast.RangeSubselect{
+				Subquery: $3,
+				Alias: &ast.Alias{AliasName: "lateral"},
+				Lateral: true,
+			}
+		}
+	| IDENT '(' ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}} }
+	| IDENT '(' expr_list ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3} }
+	| IDENT '(' ')' IDENT
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Alias: &ast.Alias{AliasName: $4}} }
+	| IDENT '(' expr_list ')' IDENT
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3, Alias: &ast.Alias{AliasName: $5}} }
+	| IDENT '(' ')' AS IDENT
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Alias: &ast.Alias{AliasName: $5}} }
+	| IDENT '(' expr_list ')' AS IDENT
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3, Alias: &ast.Alias{AliasName: $6}} }
+	| IDENT '(' expr_list ')' AS IDENT '(' name_list ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3, Alias: &ast.Alias{AliasName: $6, ColNames: $8}} }
+	| IDENT '(' expr_list ')' IDENT '(' name_list ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3, Alias: &ast.Alias{AliasName: $5, ColNames: $7}} }
 
 where_opt:
 		{ $$ = nil }
@@ -260,6 +374,28 @@ group_opt:
 		{ $$ = nil }
 	| GROUP BY expr_list
 		{ $$ = $3 }
+	| GROUP BY ROLLUP '(' expr_list ')'
+		{ $$ = $5 }
+	| GROUP BY CUBE '(' expr_list ')'
+		{ $$ = $5 }
+	| GROUP BY GROUPING SETS '(' grouping_set_list ')'
+		{ $$ = $6 }
+	| GROUP BY expr_list ',' ROLLUP '(' expr_list ')'
+		{ $$ = append($3, $7...) }
+	| GROUP BY expr_list ',' CUBE '(' expr_list ')'
+		{ $$ = append($3, $7...) }
+
+grouping_set_list:
+	grouping_set
+		{ $$ = $1 }
+	| grouping_set_list ',' grouping_set
+		{ $$ = append($1, $3...) }
+
+grouping_set:
+	'(' ')'
+		{ $$ = nil }
+	| '(' expr_list ')'
+		{ $$ = $2 }
 
 having_opt:
 		{ $$ = nil }
@@ -289,6 +425,16 @@ limit_opt:
 		{ $$ = nil }
 	| LIMIT expr
 		{ $$ = $2 }
+	| LIMIT ALL
+		{ $$ = nil }
+	| FETCH FIRST expr ROWS ONLY
+		{ $$ = $3 }
+	| FETCH NEXT expr ROWS ONLY
+		{ $$ = $3 }
+	| FETCH FIRST expr ROW ONLY
+		{ $$ = $3 }
+	| FETCH NEXT expr ROW ONLY
+		{ $$ = $3 }
 
 offset_opt:
 		{ $$ = nil }
@@ -297,20 +443,47 @@ offset_opt:
 
 /* ----- INSERT ----- */
 insert_stmt:
-	INSERT INTO qualified_name insert_cols_opt VALUES '(' insert_values ')' on_conflict_opt returning_opt
+	INSERT INTO qualified_name insert_cols_opt VALUES insert_row_list on_conflict_opt returning_opt
 		{
-			cols := make([]*ast.ResTarget, 0, len($4))
-			for _, c := range $4 {
-				cols = append(cols, &ast.ResTarget{Name: c})
+			cols := colsFromNames($4)
+			rows := make([][]ast.Node, 0, len($6))
+			for _, item := range $6 {
+				if lst, ok := item.(*ast.List); ok {
+					rows = append(rows, lst.Items)
+				}
+			}
+			// For single-row backward-compat, also set SelectStmt
+			var sel *ast.SelectStmt
+			if len(rows) == 1 {
+				sel = &ast.SelectStmt{TargetList: valuesToTargets(rows[0])}
 			}
 			$$ = &ast.InsertStmt{
-				Relation: $3,
-				Cols: cols,
-				SelectStmt: &ast.SelectStmt{TargetList: valuesToTargets($7)},
-				OnConflict: $9,
-				ReturningList: $10,
+				Relation:      $3,
+				Cols:          cols,
+				SelectStmt:    sel,
+				MultiRows:     rows,
+				OnConflict:    $7,
+				ReturningList: $8,
 			}
 		}
+	| INSERT INTO qualified_name insert_cols_opt select_stmt on_conflict_opt returning_opt
+		{
+			cols := colsFromNames($4)
+			sel, _ := $5.(*ast.SelectStmt)
+			$$ = &ast.InsertStmt{
+				Relation:      $3,
+				Cols:          cols,
+				SelectStmt:    sel,
+				OnConflict:    $6,
+				ReturningList: $7,
+			}
+		}
+
+insert_row_list:
+	'(' insert_values ')'
+		{ $$ = []ast.Node{&ast.List{Items: $2}} }
+	| insert_row_list ',' '(' insert_values ')'
+		{ $$ = append($1, &ast.List{Items: $4}) }
 
 /* INSERT VALUES items: an expression, or the DEFAULT keyword (which ORMs emit
    for serial/defaulted columns). */
@@ -349,6 +522,8 @@ returning_opt:
 update_stmt:
 	UPDATE qualified_name SET set_list where_opt returning_opt
 		{ $$ = &ast.UpdateStmt{Relation: $2, TargetList: $4, WhereClause: $5, ReturningList: $6} }
+	| UPDATE qualified_name SET set_list FROM from_list where_opt returning_opt
+		{ $$ = &ast.UpdateStmt{Relation: $2, TargetList: $4, FromClause: $6, WhereClause: $7, ReturningList: $8} }
 
 set_list:
 	set_el
@@ -367,21 +542,75 @@ set_el:
 delete_stmt:
 	DELETE FROM qualified_name where_opt returning_opt
 		{ $$ = &ast.DeleteStmt{Relation: $3, WhereClause: $4, ReturningList: $5} }
+	| DELETE FROM qualified_name USING from_list where_opt returning_opt
+		{ $$ = &ast.DeleteStmt{Relation: $3, UsingClause: $5, WhereClause: $6, ReturningList: $7} }
 
 /* ----- CREATE TABLE ----- */
 create_stmt:
-	CREATE TABLE qualified_name '(' col_def_list ')'
-		{ $$ = &ast.CreateStmt{Relation: $3, TableElts: $5} }
+	CREATE TABLE qualified_name '(' table_elem_list ')'
+		{ $$ = newCreateStmt($3, $5, false, false) }
+	| CREATE TABLE IF NOT EXISTS qualified_name '(' table_elem_list ')'
+		{ $$ = newCreateStmt($6, $8, true, false) }
+	| CREATE TEMP TABLE qualified_name '(' table_elem_list ')'
+		{ $$ = newCreateStmt($4, $6, false, true) }
+	| CREATE TEMPORARY TABLE qualified_name '(' table_elem_list ')'
+		{ $$ = newCreateStmt($4, $6, false, true) }
+	| CREATE TEMP TABLE IF NOT EXISTS qualified_name '(' table_elem_list ')'
+		{ $$ = newCreateStmt($7, $9, true, true) }
+	| CREATE TEMPORARY TABLE IF NOT EXISTS qualified_name '(' table_elem_list ')'
+		{ $$ = newCreateStmt($7, $9, true, true) }
 	| CREATE VIEW qualified_name AS select_stmt
 		{ $$ = &ast.CreateViewStmt{Relation: $3, Query: $5} }
 	| CREATE OR REPLACE VIEW qualified_name AS select_stmt
 		{ $$ = &ast.CreateViewStmt{Relation: $5, Query: $7, Replace: true} }
+	| CREATE TABLE qualified_name AS select_stmt
+		{
+			sel, _ := $5.(*ast.SelectStmt)
+			$$ = &ast.CreateStmt{Relation: $3, AsSelect: sel}
+		}
+	| CREATE TABLE IF NOT EXISTS qualified_name AS select_stmt
+		{
+			sel, _ := $8.(*ast.SelectStmt)
+			$$ = &ast.CreateStmt{Relation: $6, AsSelect: sel, IfNotExists: true}
+		}
+	| CREATE TEMP TABLE qualified_name AS select_stmt
+		{
+			sel, _ := $6.(*ast.SelectStmt)
+			$$ = &ast.CreateStmt{Relation: $4, AsSelect: sel, Temporary: true}
+		}
+	| CREATE TEMPORARY TABLE qualified_name AS select_stmt
+		{
+			sel, _ := $6.(*ast.SelectStmt)
+			$$ = &ast.CreateStmt{Relation: $4, AsSelect: sel, Temporary: true}
+		}
+	| CREATE MATERIALIZED VIEW qualified_name AS select_stmt
+		{ $$ = &ast.CreateViewStmt{Relation: $4, Query: $6, Materialized: true} }
+	| CREATE MATERIALIZED VIEW IF NOT EXISTS qualified_name AS select_stmt
+		{ $$ = &ast.CreateViewStmt{Relation: $7, Query: $9, Materialized: true, IfNotExists: true} }
 
 create_index_stmt:
-	CREATE INDEX IDENT ON qualified_name '(' name_list ')'
-		{ $$ = &ast.IndexStmt{Name: $3, Table: $5.RelName, Columns: $7} }
-	| CREATE UNIQUE INDEX IDENT ON qualified_name '(' name_list ')'
-		{ $$ = &ast.IndexStmt{Name: $4, Table: $6.RelName, Columns: $8, Unique: true} }
+	CREATE INDEX IDENT ON qualified_name '(' index_elem_list ')' index_where_opt
+		{ $$ = newIndexStmt($3, $5.RelName, $7, $9, false) }
+	| CREATE UNIQUE INDEX IDENT ON qualified_name '(' index_elem_list ')' index_where_opt
+		{ $$ = newIndexStmt($4, $6.RelName, $8, $10, true) }
+
+/* index_elem_list: each element is a plain column name or a parenthesised
+   expression (expression index). */
+index_elem_list:
+	index_elem
+		{ $$ = []ast.IndexElem{$1} }
+	| index_elem_list ',' index_elem
+		{ $$ = append($1, $3) }
+
+index_elem:
+	expr
+		{ $$ = indexElemFromExpr($1) }
+
+/* index_where_opt: optional WHERE predicate for a partial index. */
+index_where_opt:
+		{ $$ = nil }
+	| WHERE expr
+		{ $$ = $2 }
 
 drop_table_stmt:
 	DROP TABLE qualified_name
@@ -392,6 +621,30 @@ drop_table_stmt:
 		{ $$ = &ast.DropStmt{Table: $3.RelName, IsView: true} }
 	| DROP VIEW IF EXISTS qualified_name
 		{ $$ = &ast.DropStmt{Table: $5.RelName, IfExists: true, IsView: true} }
+	| DROP SEQUENCE qualified_name
+		{ $$ = &ast.DropStmt{Table: $3.RelName, IsSequence: true} }
+	| DROP SEQUENCE IF EXISTS qualified_name
+		{ $$ = &ast.DropStmt{Table: $5.RelName, IsSequence: true, IfExists: true} }
+	| DROP SCHEMA qualified_name
+		{ $$ = &ast.DropStmt{Table: $3.RelName, IsSchema: true} }
+	| DROP SCHEMA IF EXISTS IDENT
+		{ $$ = &ast.DropStmt{Table: $5, IsSchema: true, IfExists: true} }
+	| DROP EXTENSION IDENT
+		{ $$ = &ast.DropStmt{Table: $3, IsExtension: true} }
+	| DROP EXTENSION IF EXISTS IDENT
+		{ $$ = &ast.DropStmt{Table: $5, IsExtension: true, IfExists: true} }
+	| DROP TYPE qualified_name
+		{ $$ = &ast.DropStmt{Table: $3.RelName, IsType: true} }
+	| DROP TYPE IF EXISTS qualified_name
+		{ $$ = &ast.DropStmt{Table: $5.RelName, IsType: true, IfExists: true} }
+	| DROP MATERIALIZED VIEW qualified_name
+		{ $$ = &ast.DropStmt{Table: $4.RelName, IsView: true} }
+	| DROP MATERIALIZED VIEW IF EXISTS qualified_name
+		{ $$ = &ast.DropStmt{Table: $6.RelName, IsView: true, IfExists: true} }
+	| REFRESH MATERIALIZED VIEW qualified_name
+		{ $$ = &ast.DoNothingStmt{} }
+	| REFRESH MATERIALIZED VIEW CONCURRENTLY qualified_name
+		{ $$ = &ast.DoNothingStmt{} }
 
 /* COPY t [(cols)] FROM STDIN | TO STDOUT, or COPY (query) TO STDOUT. */
 copy_stmt:
@@ -431,6 +684,16 @@ copy_opt:
 	| HEADER
 		{ $$ = &ast.CopyStmt{Header: true} }
 
+/* SHOW <guc> — run-time configuration parameter. "SHOW TIME ZONE" and
+   "SHOW ALL" are the common multi-word / keyword forms. */
+show_stmt:
+	SHOW IDENT
+		{ $$ = &ast.ShowStmt{Name: $2} }
+	| SHOW IDENT IDENT
+		{ $$ = &ast.ShowStmt{Name: $2 + " " + $3} }
+	| SHOW ALL
+		{ $$ = &ast.ShowStmt{Name: "all"} }
+
 truncate_stmt:
 	TRUNCATE qualified_name
 		{ $$ = &ast.TruncateStmt{Table: $2.RelName} }
@@ -446,12 +709,143 @@ alter_table_stmt:
 		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterDropColumn, Column: ast.ColumnDef{ColName: $6}} }
 	| ALTER TABLE qualified_name DROP IDENT
 		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterDropColumn, Column: ast.ColumnDef{ColName: $5}} }
+	| ALTER TABLE qualified_name RENAME TO IDENT
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterRenameTable, NewName: $6} }
+	| ALTER TABLE IF EXISTS qualified_name RENAME TO IDENT
+		{ $$ = &ast.AlterTableStmt{Table: $5.RelName, Kind: ast.AlterRenameTable, NewName: $8} }
+	| ALTER TABLE qualified_name RENAME COLUMN IDENT TO IDENT
+		{
+			$$ = &ast.AlterTableStmt{
+				Table: $3.RelName,
+				Kind: ast.AlterRenameColumn,
+				Cmds: []ast.AlterTableCmd{{Subtype: ast.AlterRenameColumn, Name: $6, NewName: $8}},
+			}
+		}
+	| ALTER TABLE IF EXISTS qualified_name RENAME COLUMN IDENT TO IDENT
+		{
+			$$ = &ast.AlterTableStmt{
+				Table: $5.RelName,
+				Kind: ast.AlterRenameColumn,
+				Cmds: []ast.AlterTableCmd{{Subtype: ast.AlterRenameColumn, Name: $8, NewName: $10}},
+			}
+		}
+	| ALTER TABLE qualified_name RENAME CONSTRAINT IDENT TO IDENT
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterRenameTable, NewName: $8} }
+	| ALTER INDEX qualified_name RENAME TO IDENT
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterRenameTable, NewName: $6} }
+	| ALTER TABLE qualified_name alter_col_action
+		{
+			$$ = &ast.AlterTableStmt{
+				Table: $3.RelName,
+				Kind: $4.Subtype,
+				Column: ast.ColumnDef{ColName: $4.Name},
+				Cmds: []ast.AlterTableCmd{$4},
+			}
+		}
+	| ALTER TABLE IF EXISTS qualified_name alter_col_action
+		{
+			$$ = &ast.AlterTableStmt{
+				Table: $5.RelName,
+				Kind: $6.Subtype,
+				Column: ast.ColumnDef{ColName: $6.Name},
+				Cmds: []ast.AlterTableCmd{$6},
+			}
+		}
+	| ALTER TABLE qualified_name ADD add_constraint
+		{
+			$$ = &ast.AlterTableStmt{
+				Table: $3.RelName,
+				Kind: ast.AlterAddConstraint,
+				Cmds: []ast.AlterTableCmd{{Subtype: ast.AlterAddConstraint, Name: $5.Name, Constraint: $5}},
+			}
+		}
+	| ALTER TABLE IF EXISTS qualified_name ADD add_constraint
+		{
+			$$ = &ast.AlterTableStmt{
+				Table: $5.RelName,
+				Kind: ast.AlterAddConstraint,
+				Cmds: []ast.AlterTableCmd{{Subtype: ast.AlterAddConstraint, Name: $7.Name, Constraint: $7}},
+			}
+		}
+	| ALTER TABLE qualified_name ENABLE ROW LEVEL SECURITY
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterEnableRLS, Cmds: []ast.AlterTableCmd{{Subtype: ast.AlterEnableRLS}}} }
+	| ALTER TABLE qualified_name DISABLE ROW LEVEL SECURITY
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterDisableRLS, Cmds: []ast.AlterTableCmd{{Subtype: ast.AlterDisableRLS}}} }
+	| ALTER TABLE qualified_name FORCE ROW LEVEL SECURITY
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterForceRLS, Cmds: []ast.AlterTableCmd{{Subtype: ast.AlterForceRLS}}} }
+	| ALTER TABLE qualified_name NO FORCE ROW LEVEL SECURITY
+		{ $$ = &ast.AlterTableStmt{Table: $3.RelName, Kind: ast.AlterNoForceRLS, Cmds: []ast.AlterTableCmd{{Subtype: ast.AlterNoForceRLS}}} }
 
-col_def_list:
+/* ALTER [COLUMN] colname <action>. The COLUMN keyword is optional. */
+alter_col_action:
+	alter_col_kw IDENT TYPE typename
+		{ $$ = ast.AlterTableCmd{Subtype: ast.AlterColumnType, Name: $2, TypeName: $4} }
+	| alter_col_kw IDENT TYPE typename USING expr
+		{ $$ = ast.AlterTableCmd{Subtype: ast.AlterColumnType, Name: $2, TypeName: $4, UsingExpr: $6} }
+	| alter_col_kw IDENT SET DEFAULT expr
+		{ $$ = ast.AlterTableCmd{Subtype: ast.AlterSetDefault, Name: $2, DefExpr: $5} }
+	| alter_col_kw IDENT DROP DEFAULT
+		{ $$ = ast.AlterTableCmd{Subtype: ast.AlterDropDefault, Name: $2} }
+	| alter_col_kw IDENT SET NOT NULL
+		{ $$ = ast.AlterTableCmd{Subtype: ast.AlterSetNotNull, Name: $2} }
+	| alter_col_kw IDENT DROP NOT NULL
+		{ $$ = ast.AlterTableCmd{Subtype: ast.AlterDropNotNull, Name: $2} }
+
+/* alter_col_kw is the ALTER [COLUMN] prefix; COLUMN is optional. */
+alter_col_kw:
+	ALTER
+		{ }
+	| ALTER COLUMN
+		{ }
+
+/* ADD [CONSTRAINT name] { PRIMARY KEY | UNIQUE | FOREIGN KEY | CHECK }, each
+   optionally followed by a trailing [NOT] DEFERRABLE / INITIALLY clause. */
+add_constraint:
+	constraint_name_opt PRIMARY KEY '(' name_list ')' con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrPrimaryKey, Name: $1, Columns: $5, Deferrable: $7.Deferrable, InitiallyDeferred: $7.InitiallyDeferred} }
+	| constraint_name_opt UNIQUE '(' name_list ')' con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrUnique, Name: $1, Columns: $4, Deferrable: $6.Deferrable, InitiallyDeferred: $6.InitiallyDeferred} }
+	| constraint_name_opt FOREIGN KEY '(' name_list ')' REFERENCES qualified_name '(' name_list ')' ref_actions_opt con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrForeignKey, Name: $1, Columns: $5, RefTable: $8.RelName, RefColumns: $10, OnDelete: $12.OnDelete, OnUpdate: $12.OnUpdate, Deferrable: $13.Deferrable, InitiallyDeferred: $13.InitiallyDeferred} }
+	| constraint_name_opt FOREIGN KEY '(' name_list ')' REFERENCES qualified_name ref_actions_opt con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrForeignKey, Name: $1, Columns: $5, RefTable: $8.RelName, OnDelete: $9.OnDelete, OnUpdate: $9.OnUpdate, Deferrable: $10.Deferrable, InitiallyDeferred: $10.InitiallyDeferred} }
+	| constraint_name_opt CHECK '(' expr ')' con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrCheck, Name: $1, Expr: $4, Deferrable: $6.Deferrable, InitiallyDeferred: $6.InitiallyDeferred} }
+
+constraint_name_opt:
+		{ $$ = "" }
+	| CONSTRAINT IDENT
+		{ $$ = $2 }
+
+/* table_elem_list: the comma-separated body of CREATE TABLE (...). Each element
+   is either a column definition or a table-level constraint. */
+table_elem_list:
+	table_elem
+		{ $$ = tableElementList{}.add($1) }
+	| table_elem_list ',' table_elem
+		{ $$ = $1.add($3) }
+
+table_elem:
 	col_def
-		{ $$ = []ast.ColumnDef{$1} }
-	| col_def_list ',' col_def
-		{ $$ = append($1, $3) }
+		{ $$ = tableElement{col: $1, isCol: true} }
+	| table_constraint
+		{ $$ = tableElement{constraint: $1} }
+
+/* table_constraint: a table-level constraint inside CREATE TABLE, optionally
+   prefixed by CONSTRAINT name and optionally followed by a trailing
+   [NOT] DEFERRABLE / INITIALLY clause. Reuses ast.AlterTableConstraint to carry
+   detail. */
+table_constraint:
+	constraint_name_opt PRIMARY KEY '(' name_list ')' con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrPrimaryKey, Name: $1, Columns: $5, Deferrable: $7.Deferrable, InitiallyDeferred: $7.InitiallyDeferred} }
+	| constraint_name_opt UNIQUE '(' name_list ')' con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrUnique, Name: $1, Columns: $4, Deferrable: $6.Deferrable, InitiallyDeferred: $6.InitiallyDeferred} }
+	| constraint_name_opt FOREIGN KEY '(' name_list ')' REFERENCES qualified_name '(' name_list ')' ref_actions_opt con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrForeignKey, Name: $1, Columns: $5, RefTable: $8.RelName, RefColumns: $10, OnDelete: $12.OnDelete, OnUpdate: $12.OnUpdate, Deferrable: $13.Deferrable, InitiallyDeferred: $13.InitiallyDeferred} }
+	| constraint_name_opt FOREIGN KEY '(' name_list ')' REFERENCES qualified_name ref_actions_opt con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrForeignKey, Name: $1, Columns: $5, RefTable: $8.RelName, OnDelete: $9.OnDelete, OnUpdate: $9.OnUpdate, Deferrable: $10.Deferrable, InitiallyDeferred: $10.InitiallyDeferred} }
+	| constraint_name_opt CHECK '(' expr ')' con_deferral_opt
+		{ $$ = &ast.AlterTableConstraint{ConstraintType: ast.ConstrCheck, Name: $1, Expr: $4, Deferrable: $6.Deferrable, InitiallyDeferred: $6.InitiallyDeferred} }
 
 col_def:
 	IDENT typename col_qual_list_opt
@@ -469,22 +863,90 @@ col_qual_list:
 		{ $$ = append($1, $2) }
 
 col_qual:
-	NOT NULL
-		{ $$ = ast.ColQual{Kind: ast.ColQualNotNull} }
-	| NULL
-		{ $$ = ast.ColQual{Kind: ast.ColQualNull} }
-	| PRIMARY KEY
-		{ $$ = ast.ColQual{Kind: ast.ColQualPrimaryKey} }
-	| UNIQUE
-		{ $$ = ast.ColQual{Kind: ast.ColQualUnique} }
+	col_qual_body
+		{ $$ = $1 }
+	| CONSTRAINT IDENT col_qual_body
+		{ q := $3; q.ConstraintName = $2; $$ = q }
+
+/* col_qual_body is a single inline column constraint, optionally followed by a
+   trailing [NOT] DEFERRABLE / INITIALLY { DEFERRED | IMMEDIATE } clause. The
+   deferral flags are stored on the ColQual but not enforced single-node — the
+   point is that Rails/Django migrations parse without error. */
+col_qual_body:
+	NOT NULL con_deferral_opt
+		{ q := ast.ColQual{Kind: ast.ColQualNotNull}; applyDeferral(&q, $3); $$ = q }
+	| NULL con_deferral_opt
+		{ q := ast.ColQual{Kind: ast.ColQualNull}; applyDeferral(&q, $2); $$ = q }
+	| PRIMARY KEY con_deferral_opt
+		{ q := ast.ColQual{Kind: ast.ColQualPrimaryKey}; applyDeferral(&q, $3); $$ = q }
+	| UNIQUE con_deferral_opt
+		{ q := ast.ColQual{Kind: ast.ColQualUnique}; applyDeferral(&q, $2); $$ = q }
 	| DEFAULT expr %prec COLDEFAULT
 		{ $$ = ast.ColQual{Kind: ast.ColQualDefault, Expr: $2} }
-	| REFERENCES qualified_name
-		{ $$ = ast.ColQual{Kind: ast.ColQualReferences, RefTable: $2.RelName} }
-	| REFERENCES qualified_name '(' IDENT ')'
-		{ $$ = ast.ColQual{Kind: ast.ColQualReferences, RefTable: $2.RelName, RefCol: $4} }
+	| REFERENCES qualified_name ref_actions_opt con_deferral_opt
+		{ q := ast.ColQual{Kind: ast.ColQualReferences, RefTable: $2.RelName, OnDelete: $3.OnDelete, OnUpdate: $3.OnUpdate}; applyDeferral(&q, $4); $$ = q }
+	| REFERENCES qualified_name '(' IDENT ')' ref_actions_opt con_deferral_opt
+		{ q := ast.ColQual{Kind: ast.ColQualReferences, RefTable: $2.RelName, RefCol: $4, OnDelete: $6.OnDelete, OnUpdate: $6.OnUpdate}; applyDeferral(&q, $7); $$ = q }
 	| CHECK '(' expr ')'
 		{ $$ = ast.ColQual{Kind: ast.ColQualCheck, Expr: $3} }
+	| GENERATED ALWAYS AS IDENTITY identity_seq_opt
+		{ $$ = ast.ColQual{Kind: ast.ColQualIdentity, Identity: true, IdentityAlways: true} }
+	| GENERATED BY DEFAULT AS IDENTITY identity_seq_opt
+		{ $$ = ast.ColQual{Kind: ast.ColQualIdentity, Identity: true, IdentityAlways: false} }
+	| GENERATED ALWAYS AS '(' expr ')' STORED
+		{ $$ = ast.ColQual{Kind: ast.ColQualGenerated, Generated: true, GeneratedExpr: $5} }
+
+/* con_deferral_opt collects the trailing constraint-attribute clause. It carries
+   the two flags on a ColQual value (Deferrable / InitiallyDeferred) which the
+   caller merges via applyDeferral. */
+con_deferral_opt:
+		{ $$ = ast.ColQual{} }
+	| con_deferral_opt DEFERRABLE
+		{ q := $1; q.Deferrable = true; $$ = q }
+	| con_deferral_opt NOT_DEFERRABLE
+		{ q := $1; q.Deferrable = false; $$ = q }
+	| con_deferral_opt INITIALLY DEFERRED
+		{ q := $1; q.InitiallyDeferred = true; $$ = q }
+	| con_deferral_opt INITIALLY IMMEDIATE
+		{ q := $1; q.InitiallyDeferred = false; $$ = q }
+
+/* identity_seq_opt accepts the optional `( sequence_options )` blob that may
+   follow GENERATED ... AS IDENTITY (e.g. ( START WITH 1 INCREMENT BY 1 )). The
+   options are parsed (via the existing seq_opt_list) and discarded. */
+identity_seq_opt:
+		{ }
+	| '(' seq_opt_list ')'
+		{ }
+	| '(' ')'
+		{ }
+
+/* on_delete_opt / on_update_opt collect the trailing referential actions of a
+   REFERENCES / FOREIGN KEY clause. ref_action returns the canonical action
+   string. Both orderings (ON DELETE before ON UPDATE) are accepted; PostgreSQL
+   also permits the reverse order, but ORMs emit ON DELETE first, so the grammar
+   fixes that order to stay conflict-free. */
+/* ref_actions_opt collects zero or more `ON DELETE <action>` / `ON UPDATE
+   <action>` clauses in any order into a single ColQual carrying OnDelete /
+   OnUpdate. Folding both into one left-recursive list (rather than two adjacent
+   optionals that both begin with ON) keeps the grammar LALR(1)-unambiguous. */
+ref_actions_opt:
+		{ $$ = ast.ColQual{} }
+	| ref_actions_opt ON DELETE ref_action
+		{ q := $1; q.OnDelete = $4; $$ = q }
+	| ref_actions_opt ON UPDATE ref_action
+		{ q := $1; q.OnUpdate = $4; $$ = q }
+
+ref_action:
+	NO ACTION
+		{ $$ = "NO ACTION" }
+	| RESTRICT
+		{ $$ = "RESTRICT" }
+	| CASCADE
+		{ $$ = "CASCADE" }
+	| SET NULL
+		{ $$ = "SET NULL" }
+	| SET DEFAULT
+		{ $$ = "SET DEFAULT" }
 
 /* A SQL type name: one or more words (double precision, timestamp with time
    zone), with an optional precision/length modifier (varchar(255),
@@ -497,6 +959,18 @@ typename:
 		{ $$ = $1 }
 	| type_words '(' ICONST ',' ICONST ')'
 		{ $$ = $1 }
+	| type_words '[' ']'
+		{ $$ = $1 + "[]" }
+	| type_words '[' ICONST ']'
+		{ $$ = $1 + "[]" }
+	| type_words ARRAY
+		{ $$ = $1 + "[]" }
+	| INTERVAL
+		{ $$ = "interval" }
+	| INTERVAL '(' ICONST ')'
+		{ $$ = "interval" }
+	| INTERVAL type_words
+		{ $$ = "interval" }
 
 type_words:
 	IDENT
@@ -516,6 +990,8 @@ cast_type:
 		{ $$ = $1 }
 	| IDENT '(' ICONST ',' ICONST ')'
 		{ $$ = $1 }
+	| cast_type '[' ']'
+		{ $$ = $1 + "[]" }
 
 /* ----- branch DDL ----- */
 create_branch_stmt:
@@ -533,6 +1009,85 @@ merge_branch_stmt:
 drop_branch_stmt:
 	DROP BRANCH IDENT
 		{ $$ = &ast.DropBranchStmt{BranchName: $3} }
+
+/* ----- Row-Level Security DDL ----- */
+create_policy_stmt:
+	CREATE POLICY IDENT ON qualified_name policy_permissive_opt policy_command_opt policy_to_opt policy_using_opt policy_check_opt
+		{
+			$$ = &ast.CreatePolicyStmt{
+				PolicyName: $3,
+				Table:      $5.RelName,
+				Permissive: $6,
+				Command:    $7,
+				Roles:      $8,
+				Using:      $9,
+				WithCheck:  $10,
+			}
+		}
+
+alter_policy_stmt:
+	ALTER POLICY IDENT ON qualified_name policy_to_opt policy_using_opt policy_check_opt
+		{
+			$$ = &ast.AlterPolicyStmt{
+				PolicyName: $3,
+				Table:      $5.RelName,
+				Roles:      $6,
+				Using:      $7,
+				WithCheck:  $8,
+			}
+		}
+
+drop_policy_stmt:
+	DROP POLICY IDENT ON qualified_name
+		{ $$ = &ast.DropPolicyStmt{PolicyName: $3, Table: $5.RelName} }
+	| DROP POLICY IF EXISTS IDENT ON qualified_name
+		{ $$ = &ast.DropPolicyStmt{PolicyName: $5, Table: $7.RelName, IfExists: true} }
+
+/* [AS { PERMISSIVE | RESTRICTIVE }] — default PERMISSIVE (true). */
+policy_permissive_opt:
+		{ $$ = true }
+	| AS PERMISSIVE
+		{ $$ = true }
+	| AS RESTRICTIVE
+		{ $$ = false }
+
+/* [FOR { ALL | SELECT | INSERT | UPDATE | DELETE }] — default "ALL". */
+policy_command_opt:
+		{ $$ = "ALL" }
+	| FOR ALL
+		{ $$ = "ALL" }
+	| FOR SELECT
+		{ $$ = "SELECT" }
+	| FOR INSERT
+		{ $$ = "INSERT" }
+	| FOR UPDATE
+		{ $$ = "UPDATE" }
+	| FOR DELETE
+		{ $$ = "DELETE" }
+
+/* [TO role_list] */
+policy_to_opt:
+		{ $$ = nil }
+	| TO role_list
+		{ $$ = $2 }
+
+role_list:
+	IDENT
+		{ $$ = []string{$1} }
+	| role_list ',' IDENT
+		{ $$ = append($1, $3) }
+
+/* [USING ( expr )] */
+policy_using_opt:
+		{ $$ = nil }
+	| USING '(' expr ')'
+		{ $$ = $3 }
+
+/* [WITH CHECK ( expr )] */
+policy_check_opt:
+		{ $$ = nil }
+	| WITH CHECK '(' expr ')'
+		{ $$ = $4 }
 
 /* ----- expressions ----- */
 expr_list:
@@ -570,10 +1125,42 @@ expr:
 		{ $$ = &ast.FuncCall{FuncName: []string{$1}, AggStar: true, Over: $7} }
 	| IDENT '(' expr_list ')' OVER '(' window_spec ')'
 		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3, Over: $7} }
+	| IDENT '(' DISTINCT expr_list ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $4, AggDistinct: true} }
+	| IDENT '(' STAR ')' FILTER '(' WHERE expr ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, AggStar: true, Filter: $8} }
+	| IDENT '(' expr_list ')' FILTER '(' WHERE expr ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3, Filter: $8} }
+	| IDENT '(' DISTINCT expr_list ')' FILTER '(' WHERE expr ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $4, AggDistinct: true, Filter: $9} }
+	| IDENT '(' expr_list ')' WITHIN GROUP '(' order_opt ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{$1}, Args: $3, WithinGroup: &ast.WindowDef{OrderBy: $8}} }
+	/* SIMILAR TO is rewritten to LIKE in normalizeSQLForParsing (conn.go) before
+	   the grammar sees it, so no grammar rule is needed here. */
 	| '(' expr ')'
 		{ $$ = $2 }
+	| '(' expr ')' '.' IDENT
+		{ $$ = &ast.FieldSelect{Arg: $2, Field: $5} }
+	| ROW '(' expr_list ')'
+		{ $$ = &ast.RowExpr{Items: $3} }
+	| ROW '(' ')'
+		{ $$ = &ast.RowExpr{} }
+	| '(' expr ',' expr_list ')'
+		{ $$ = &ast.RowExpr{Items: append([]ast.Node{$2}, $4...)} }
 	| case_expr
 		{ $$ = $1 }
+	| CAST '(' expr AS cast_type ')'
+		{ $$ = &ast.TypeCast{Arg: $3, TypeName: $5} }
+	| INTERVAL SCONST
+		{ $$ = &ast.TypeCast{Arg: &ast.A_Const{Type: ast.ConstString, Val: $2}, TypeName: "interval"} }
+	| ARRAY '[' expr_list ']'
+		{ $$ = &ast.FuncCall{FuncName: []string{"array_constructor"}, Args: $3} }
+	| ARRAY '[' ']'
+		{ $$ = &ast.FuncCall{FuncName: []string{"array_constructor"}} }
+	| ARRAY '(' select_stmt ')'
+		{ $$ = &ast.FuncCall{FuncName: []string{"array_from_subquery"}, Args: []ast.Node{&ast.SubLink{SubSelect: $3}}} }
+	| EXISTS '(' select_stmt ')'
+		{ $$ = &ast.SubLink{SubSelect: $3, Exists: true} }
 	| '(' select_stmt ')'
 		{ $$ = &ast.SubLink{SubSelect: $2} }
 	| expr IN '(' select_stmt ')'
@@ -596,6 +1183,10 @@ expr:
 		{ $$ = &ast.A_Expr{Kind: ast.AEXPR_OP, Name: $2, Lexpr: $1, Rexpr: $3} }
 	| expr COMPARE_OP expr
 		{ $$ = &ast.A_Expr{Kind: ast.AEXPR_OP, Name: $2, Lexpr: $1, Rexpr: $3} }
+	| expr POW_OP expr
+		{ $$ = &ast.A_Expr{Kind: ast.AEXPR_OP, Name: "^", Lexpr: $1, Rexpr: $3} }
+	| expr CONTAIN_OP expr
+		{ $$ = &ast.A_Expr{Kind: ast.AEXPR_OP, Name: "&&", Lexpr: $1, Rexpr: $3} }
 	| expr AND expr
 		{ $$ = &ast.BoolExpr{Op: ast.AND_EXPR, Args: []ast.Node{$1, $3}} }
 	| expr OR expr
@@ -649,4 +1240,279 @@ name_list:
 	| name_list ',' IDENT
 		{ $$ = append($1, $3) }
 
+/* ----- FOR UPDATE / SHARE locking clause (discarded) ----- */
+for_update_clause_opt:
+		{ $$ = false }
+	| FOR UPDATE
+		{ $$ = false }
+	| FOR UPDATE NOWAIT
+		{ $$ = false }
+	| FOR UPDATE SKIP LOCKED
+		{ $$ = false }
+	| FOR SHARE
+		{ $$ = false }
+	| FOR SHARE NOWAIT
+		{ $$ = false }
+	| FOR NO KEY UPDATE
+		{ $$ = false }
+	| FOR KEY SHARE
+		{ $$ = false }
+
+/* ----- SAVEPOINT ----- */
+savepoint_stmt:
+	SAVEPOINT IDENT
+		{ $$ = &ast.SavepointStmt{Name: $2} }
+
+release_savepoint_stmt:
+	RELEASE SAVEPOINT IDENT
+		{ $$ = &ast.SavepointStmt{Name: $3, Release: true} }
+	| RELEASE IDENT
+		{ $$ = &ast.SavepointStmt{Name: $2, Release: true} }
+
+/* ----- CREATE SEQUENCE ----- */
+create_seq_stmt:
+	CREATE SEQUENCE qualified_name
+		{ $$ = &ast.CreateSeqStmt{Sequence: $3} }
+	| CREATE SEQUENCE IF NOT EXISTS qualified_name
+		{ $$ = &ast.CreateSeqStmt{Sequence: $6, IfNotExists: true} }
+	| CREATE SEQUENCE qualified_name seq_opt_list
+		{ $$ = &ast.CreateSeqStmt{Sequence: $3} }
+	| CREATE SEQUENCE IF NOT EXISTS qualified_name seq_opt_list
+		{ $$ = &ast.CreateSeqStmt{Sequence: $6, IfNotExists: true} }
+
+seq_opt_list:
+	seq_opt
+		{ }
+	| seq_opt_list seq_opt
+		{ }
+
+seq_opt:
+	START WITH ICONST    { }
+	| START ICONST       { }
+	| INCREMENT BY ICONST { }
+	| INCREMENT ICONST   { }
+	| MINVALUE ICONST    { }
+	| MAXVALUE ICONST    { }
+	| NO MINVALUE        { }
+	| NO MAXVALUE        { }
+	| CYCLE              { }
+	| NO CYCLE           { }
+	| CACHE ICONST       { }
+	| OWNED BY qualified_name { }
+	| OWNED BY NO        { }
+
+/* ----- CREATE SCHEMA ----- */
+create_schema_stmt:
+	CREATE SCHEMA IDENT
+		{ $$ = &ast.CreateSchemaStmt{SchemaName: $3} }
+	| CREATE SCHEMA IF NOT EXISTS IDENT
+		{ $$ = &ast.CreateSchemaStmt{SchemaName: $6, IfNotExists: true} }
+	| CREATE SCHEMA AUTHORIZATION IDENT
+		{ $$ = &ast.CreateSchemaStmt{SchemaName: $4} }
+
+/* ----- CREATE EXTENSION ----- */
+create_extension_stmt:
+	CREATE EXTENSION IDENT
+		{ $$ = &ast.CreateExtensionStmt{ExtName: $3} }
+	| CREATE EXTENSION IF NOT EXISTS IDENT
+		{ $$ = &ast.CreateExtensionStmt{ExtName: $6, IfNotExists: true} }
+	| CREATE EXTENSION IDENT WITH SCHEMA IDENT
+		{ $$ = &ast.CreateExtensionStmt{ExtName: $3} }
+	| CREATE EXTENSION IF NOT EXISTS IDENT WITH SCHEMA IDENT
+		{ $$ = &ast.CreateExtensionStmt{ExtName: $6, IfNotExists: true} }
+
+/* ----- CREATE TYPE AS ENUM / composite / shell ----- */
+create_type_stmt:
+	CREATE TYPE qualified_name AS ENUM '(' enum_val_list ')'
+		{ $$ = &ast.CreateEnumStmt{TypeName: $3, Vals: $7} }
+	| CREATE TYPE qualified_name AS ENUM '(' ')'
+		{ $$ = &ast.CreateEnumStmt{TypeName: $3} }
+	| CREATE TYPE qualified_name AS '(' composite_attr_list ')'
+		{ $$ = &ast.CreateTypeStmt{Name: $3.RelName, Fields: $6} }
+	| CREATE TYPE qualified_name
+		{ $$ = &ast.CreateEnumStmt{TypeName: $3} }
+
+composite_attr_list:
+	composite_attr
+		{ $$ = []ast.CompositeField{$1} }
+	| composite_attr_list ',' composite_attr
+		{ $$ = append($1, $3) }
+
+composite_attr:
+	IDENT typename
+		{ $$ = ast.CompositeField{Name: $1, TypeName: $2} }
+	| IDENT typename col_qual_list
+		{ $$ = ast.CompositeField{Name: $1, TypeName: $2} }
+
+enum_val_list:
+	SCONST
+		{ $$ = []string{$1} }
+	| enum_val_list ',' SCONST
+		{ $$ = append($1, $3) }
+
+/* ----- LISTEN / NOTIFY / UNLISTEN ----- */
+listen_stmt:
+	LISTEN IDENT
+		{ $$ = &ast.ListenStmt{Channel: $2} }
+
+notify_stmt:
+	NOTIFY IDENT
+		{ $$ = &ast.ListenStmt{Channel: $2, IsNotify: true} }
+	| NOTIFY IDENT ',' SCONST
+		{ $$ = &ast.ListenStmt{Channel: $2, IsNotify: true, Payload: $4} }
+
+unlisten_stmt:
+	UNLISTEN IDENT
+		{ $$ = &ast.ListenStmt{Channel: $2, IsUnlisten: true} }
+	| UNLISTEN STAR
+		{ $$ = &ast.ListenStmt{Channel: "*", IsUnlisten: true} }
+
+/* ----- VACUUM / ANALYSE ----- */
+vacuum_stmt:
+	VACUUM
+		{ $$ = &ast.SavepointStmt{Name: "vacuum"} }
+	| VACUUM qualified_name
+		{ $$ = &ast.SavepointStmt{Name: "vacuum"} }
+	| VACUUM IDENT qualified_name
+		{ $$ = &ast.SavepointStmt{Name: "vacuum"} }
+	| VACUUM IDENT IDENT qualified_name
+		{ $$ = &ast.SavepointStmt{Name: "vacuum"} }
+	| ANALYSE
+		{ $$ = &ast.SavepointStmt{Name: "analyze"} }
+	| ANALYSE qualified_name
+		{ $$ = &ast.SavepointStmt{Name: "analyze"} }
+	| REINDEX IDENT qualified_name
+		{ $$ = &ast.SavepointStmt{Name: "reindex"} }
+	| REINDEX TABLE qualified_name
+		{ $$ = &ast.SavepointStmt{Name: "reindex"} }
+	| REINDEX INDEX qualified_name
+		{ $$ = &ast.SavepointStmt{Name: "reindex"} }
+
+/* ----- DO NOTHING stub ----- */
+/* This rule is never reached via the grammar because complex statements like
+   CREATE FUNCTION are intercepted in normalizeSQLForParsing before parsing.
+   It exists so that any future grammar-level stub can emit this node. */
+do_nothing_stmt:
+	DO NOTHING
+		{ $$ = &ast.DoNothingStmt{} }
+
+/* ----- EXPLAIN ----- */
+explain_stmt:
+	EXPLAIN stmt
+		{ $$ = &ast.ExplainStmt{Query: $2} }
+	| EXPLAIN ANALYSE stmt
+		{ $$ = &ast.ExplainStmt{Query: $3, Analyze: true} }
+	| EXPLAIN VERBOSE stmt
+		{ $$ = &ast.ExplainStmt{Query: $3, Verbose: true} }
+	| EXPLAIN '(' explain_opt_list ')' stmt
+		{ $$ = &ast.ExplainStmt{Query: $5} }
+
+explain_opt_list:
+	IDENT
+		{ }
+	| explain_opt_list ',' IDENT
+		{ }
+	| IDENT TRUE
+		{ }
+	| IDENT FALSE
+		{ }
+	| IDENT ANALYSE
+		{ }
+	| IDENT VERBOSE
+		{ }
+
 %%
+
+// distinctClause carries the result of the distinct_opt grammar rule: whether
+// DISTINCT was present and, for DISTINCT ON (exprs), the expression list.
+type distinctClause struct {
+	distinct bool
+	on       []ast.Node
+}
+
+// tableElement is one entry in a CREATE TABLE element list: either a column
+// definition (isCol) or a table-level constraint.
+type tableElement struct {
+	col        ast.ColumnDef
+	isCol      bool
+	constraint *ast.AlterTableConstraint
+}
+
+// tableElementList accumulates the column definitions and table-level
+// constraints parsed from a CREATE TABLE element list, preserving order within
+// each category.
+type tableElementList struct {
+	cols        []ast.ColumnDef
+	constraints []*ast.AlterTableConstraint
+}
+
+// add appends one element to the list, routing it to the column or constraint
+// slice, and returns the updated list (value semantics for goyacc).
+func (l tableElementList) add(e tableElement) tableElementList {
+	if e.isCol {
+		l.cols = append(l.cols, e.col)
+	} else if e.constraint != nil {
+		l.constraints = append(l.constraints, e.constraint)
+	}
+	return l
+}
+
+// newCreateStmt builds a CREATE TABLE statement node from a parsed element list,
+// splitting it into column definitions (TableElts) and table-level constraints
+// (TableConstraints).
+func newCreateStmt(rel *ast.RangeVar, elems tableElementList, ifNotExists, temporary bool) *ast.CreateStmt {
+	return &ast.CreateStmt{
+		Relation:         rel,
+		TableElts:        elems.cols,
+		TableConstraints: elems.constraints,
+		IfNotExists:      ifNotExists,
+		Temporary:        temporary,
+	}
+}
+
+// indexElemFromExpr classifies a parsed index-element expression. A bare,
+// unqualified single-column reference becomes a plain column element (ColName);
+// anything else (qualified ref, function call, operator expression) is an
+// expression index element (Expr).
+func indexElemFromExpr(e ast.Node) ast.IndexElem {
+	if cr, ok := e.(*ast.ColumnRef); ok && len(cr.Fields) == 1 && cr.Fields[0] != "*" {
+		return ast.IndexElem{ColName: cr.Fields[0]}
+	}
+	return ast.IndexElem{Expr: e}
+}
+
+// newIndexStmt builds an IndexStmt from a parsed index-element list and optional
+// partial-index predicate. It also populates the legacy Columns slice with each
+// element's column name (empty string for expression elements) so existing
+// executor paths that read Columns keep working.
+func newIndexStmt(name, table string, elems []ast.IndexElem, where ast.Node, unique bool) *ast.IndexStmt {
+	cols := make([]string, 0, len(elems))
+	for _, e := range elems {
+		cols = append(cols, e.ColName)
+	}
+	return &ast.IndexStmt{
+		Name:    name,
+		Table:   table,
+		Columns: cols,
+		Elems:   elems,
+		Where:   where,
+		Unique:  unique,
+	}
+}
+
+// applyDeferral folds the trailing [NOT] DEFERRABLE / INITIALLY clause flags
+// (accumulated in src) onto a column qualifier q. Single-node accepts and
+// ignores these — they exist so Rails/Django migrations parse without error.
+func applyDeferral(q *ast.ColQual, src ast.ColQual) {
+	q.Deferrable = src.Deferrable
+	q.InitiallyDeferred = src.InitiallyDeferred
+}
+
+// colsFromNames converts a string slice of column names into ResTarget pointers.
+func colsFromNames(names []string) []*ast.ResTarget {
+	cols := make([]*ast.ResTarget, 0, len(names))
+	for _, c := range names {
+		cols = append(cols, &ast.ResTarget{Name: c})
+	}
+	return cols
+}

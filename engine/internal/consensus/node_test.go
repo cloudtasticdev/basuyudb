@@ -34,9 +34,10 @@ func TestRaftProposeApplies(t *testing.T) {
 	}
 	defer store.Close()
 
+	raftAddr := freeAddr(t)
 	node, err := New(Config{
 		ReplicaID: 1,
-		RaftAddress: "127.0.0.1:63010",
+		RaftAddress: raftAddr,
 		DataDir: t.TempDir(),
 	})
 	if err != nil {
@@ -45,7 +46,7 @@ func TestRaftProposeApplies(t *testing.T) {
 	defer node.Stop()
 
 	const shard = 1
-	if err := node.StartShard(shard, map[uint64]string{1: "127.0.0.1:63010"}, false, store); err != nil {
+	if err := node.StartShard(shard, map[uint64]string{1: raftAddr}, false, store); err != nil {
 		t.Fatal(err)
 	}
 

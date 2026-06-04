@@ -50,6 +50,69 @@ var keywords = map[string]int{
 	"OVER": OVER, "PARTITION": PARTITION, "VIEW": VIEW, "REPLACE": REPLACE,
 	"COPY": COPY, "TO": TO, "STDIN": STDIN, "STDOUT": STDOUT,
 	"FORMAT": FORMAT, "DELIMITER": DELIMITER, "HEADER": HEADER,
+	"SHOW": SHOW, "CAST": CAST,
+	"SAVEPOINT": SAVEPOINT, "RELEASE": RELEASE,
+	"LATERAL": LATERAL,
+	"SEQUENCE": SEQUENCE, "EXTENSION": EXTENSION, "SCHEMA": SCHEMA,
+	"LISTEN": LISTEN, "NOTIFY": NOTIFY, "UNLISTEN": UNLISTEN,
+	"ENUM": ENUM, "TYPE": TYPE,
+	"FOR": FOR,
+	"SHARE": SHARE, "NOWAIT": NOWAIT, "SKIP": SKIP, "LOCKED": LOCKED,
+	"START": START, "INCREMENT": INCREMENT,
+	"MINVALUE": MINVALUE, "MAXVALUE": MAXVALUE,
+	"CYCLE": CYCLE, "CACHE": CACHE, "OWNED": OWNED,
+	"AUTHORIZATION": AUTHORIZATION,
+	"NO": NO,
+	"VACUUM": VACUUM, "ANALYSE": ANALYSE, "ANALYZE": ANALYSE,
+	"REINDEX": REINDEX,
+	"ARRAY":      ARRAY,
+	"INTERVAL":   INTERVAL,
+	"TEMP":       TEMP,
+	"TEMPORARY":  TEMPORARY,
+	"RENAME":     RENAME,
+	"CONSTRAINT": CONSTRAINT,
+	// New tokens for PostgreSQL compatibility extensions
+	"RECURSIVE":    RECURSIVE,
+	"EXPLAIN":      EXPLAIN,
+	"VERBOSE":      VERBOSE,
+	"FILTER":       FILTER,
+	"WITHIN":       WITHIN,
+	"MATERIALIZED": MATERIALIZED,
+	"REFRESH":      REFRESH,
+	"CONCURRENTLY": CONCURRENTLY,
+	"ROLLUP":       ROLLUP,
+	"CUBE":         CUBE,
+	"GROUPING":     GROUPING,
+	"SETS":         SETS,
+	"FETCH":        FETCH,
+	"FIRST":        FIRST,
+	"NEXT":         NEXT,
+	"ROWS":         ROWS,
+	"ROW":          ROW,
+	"ONLY":         ONLY,
+	"SIMILAR":      SIMILAR,
+	"DEFERRABLE":   DEFERRABLE,
+	"INITIALLY":    INITIALLY,
+	"DEFERRED":     DEFERRED,
+	"IMMEDIATE":    IMMEDIATE,
+	"GENERATED":    GENERATED,
+	"ALWAYS":       ALWAYS,
+	"IDENTITY":     IDENTITY,
+	"STORED":       STORED,
+	"ACTION":       ACTION,
+	"CASCADE":      CASCADE,
+	"RESTRICT":     RESTRICT,
+	// Row-Level Security DDL keywords.
+	"POLICY":      POLICY,
+	"PERMISSIVE":  PERMISSIVE,
+	"RESTRICTIVE": RESTRICTIVE,
+	"FORCE":       FORCE,
+	"LEVEL":       LEVEL,
+	"SECURITY":    SECURITY,
+	"ENABLE":      ENABLE,
+	"DISABLE":     DISABLE,
+	// SERIALIZABLE is rewritten to READ COMMITTED in normalizeSQLForParsing
+	// before the lexer sees it, so it intentionally remains an IDENT.
 }
 
 // Lex implements the goyacc yyLexer interface. It scans the next token, fills
@@ -208,11 +271,40 @@ func (l *lexer) scanIdentOrKeyword(lval *yySymType) int {
 	}
 	word := l.src[start:l.pos]
 	if tok, ok := keywords[strings.ToUpper(word)]; ok && tok > 0 {
+		// `NOT DEFERRABLE` is collapsed into a single NOT_DEFERRABLE token so the
+		// trailing constraint-attribute clause stays LALR(1)-unambiguous against a
+		// following `NOT NULL` qualifier. DEFERRABLE is a reserved keyword that
+		// never validly follows a boolean NOT, so this lookahead is safe.
+		if tok == NOT && l.peekIsDeferrable() {
+			return NOT_DEFERRABLE
+		}
 		lval.str = strings.ToUpper(word)
 		return tok
 	}
 	lval.str = strings.ToLower(word) // unquoted identifiers fold to lower-case (PG)
 	return IDENT
+}
+
+// peekIsDeferrable reports whether the next lexeme is the DEFERRABLE keyword,
+// consuming it only in that case. It is used to collapse `NOT DEFERRABLE` into a
+// single NOT_DEFERRABLE token. On any other lookahead the input is left
+// untouched (l.pos restored), so a following `NULL` etc. is lexed normally.
+func (l *lexer) peekIsDeferrable() bool {
+	save := l.pos
+	l.skipSpaceAndComments()
+	if l.pos >= len(l.src) || !isIdentStart(l.src[l.pos]) {
+		l.pos = save
+		return false
+	}
+	start := l.pos
+	for l.pos < len(l.src) && isIdentPart(l.src[l.pos]) {
+		l.pos++
+	}
+	if t, found := keywords[strings.ToUpper(l.src[start:l.pos])]; found && t == DEFERRABLE {
+		return true // DEFERRABLE consumed
+	}
+	l.pos = save
+	return false
 }
 
 // scanOperatorOrPunct handles multi-char operators and single-char punctuation,
@@ -231,9 +323,10 @@ func (l *lexer) scanOperatorOrPunct(lval *yySymType) int {
 		s string
 		tok int
 	}{
-		{"->>", JSON_OP}, {"#>>", JSON_OP}, {"->", JSON_OP},
+		{"->>", JSON_OP}, {"#>>", JSON_OP}, {"#>", JSON_OP}, {"->", JSON_OP},
 		{"<=>", VECTOR_OP}, {"<->", VECTOR_OP}, {"<#>", VECTOR_OP},
 		{"<=", COMPARE_OP}, {">=", COMPARE_OP}, {"<>", COMPARE_OP}, {"!=", COMPARE_OP},
+		{"&&", CONTAIN_OP},
 		{"::", TYPECAST},
 	}
 	for _, m := range multi {
@@ -253,6 +346,10 @@ func (l *lexer) scanOperatorOrPunct(lval *yySymType) int {
 		return '('
 	case ')':
 		return ')'
+	case '[':
+		return '['
+	case ']':
+		return ']'
 	case ',':
 		return ','
 	case '.':
@@ -271,6 +368,9 @@ func (l *lexer) scanOperatorOrPunct(lval *yySymType) int {
 	case '/', '%':
 		lval.str = string(c)
 		return MUL_OP
+	case '^':
+		lval.str = "^"
+		return POW_OP
 	}
 	l.Error(fmt.Sprintf("unexpected character %q", c))
 	return 0

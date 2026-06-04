@@ -35,7 +35,7 @@ func TestConsistencyBankTransfers(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed accounts.
-	seed := pgxConnect(t, addr, true)
+	seed := pgxConnect(t, addr, false)
 	if _, err := seed.Exec(ctx, "CREATE TABLE acct (id INT PRIMARY KEY, bal INT NOT NULL)"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestConsistencyBankTransfers(t *testing.T) {
 		go func(seed int64) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed))
-			conn := pgxConnect(t, addr, true)
+			conn := pgxConnect(t, addr, false)
 			defer conn.Close(ctx)
 			for i := 0; i < perWorker; i++ {
 				from := rng.Intn(accounts)
@@ -79,7 +79,7 @@ func TestConsistencyBankTransfers(t *testing.T) {
 	// Checker: the visible total must always equal the seeded total.
 	var checkErr atomic.Pointer[string]
 	go func() {
-		c := pgxConnect(t, addr, true)
+		c := pgxConnect(t, addr, false)
 		defer c.Close(ctx)
 		for {
 			select {
@@ -107,7 +107,7 @@ func TestConsistencyBankTransfers(t *testing.T) {
 	}
 
 	// Final invariant: total preserved exactly.
-	conn := pgxConnect(t, addr, true)
+	conn := pgxConnect(t, addr, false)
 	defer conn.Close(ctx)
 	var sum int
 	if err := conn.QueryRow(ctx, "SELECT sum(bal) FROM acct").Scan(&sum); err != nil {

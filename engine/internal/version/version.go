@@ -4,7 +4,8 @@
 package version
 
 // Number is the semantic version of the engine (no leading "v").
-const Number = "0.7.0"
+// 0.8.x is the public beta line; 1.0.0 is reserved for GA.
+const Number = "0.8.0"
 
 // PGWireServerVersion is the value reported for the PostgreSQL `server_version`
 // parameter and version() — it advertises PG-15 wire compatibility plus the

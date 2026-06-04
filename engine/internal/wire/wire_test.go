@@ -25,7 +25,10 @@ func startTestServer(t *testing.T) string {
 		t.Fatal(err)
 	}
 	txnEngine := transactions.New(st, 1, nil)
-	srv := NewServer(Config{Addr: "127.0.0.1:0", Executor: executor.New(st, txnEngine), DevMode: true})
+	srv, err := NewServer(Config{Addr: "127.0.0.1:0", Executor: executor.New(st, txnEngine), DevMode: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := srv.Listen(); err != nil {
 		t.Fatal(err)
 	}

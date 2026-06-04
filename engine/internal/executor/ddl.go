@@ -3,6 +3,8 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"strconv"
+	"strings"
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/session"
@@ -165,6 +167,110 @@ func (e *execImpl) execAlterTable(ctx context.Context, s *ast.AlterTableStmt, se
 		if sch.PKIndex > idx {
 			sch.PKIndex--
 		}
+
+	case ast.AlterEnableRLS:
+		sch.RLSEnabled = true
+	case ast.AlterDisableRLS:
+		sch.RLSEnabled = false
+	case ast.AlterForceRLS:
+		sch.RLSForced = true
+	case ast.AlterNoForceRLS:
+		sch.RLSForced = false
+
+	case ast.AlterRenameTable:
+		// RENAME TO: tables are keyed by name (no stable OID), so migrate the
+		// schema, index metadata, every row, and every index entry to the new name
+		// prefix, then remove the old keys. Data is accessible under the new name
+		// and gone from the old.
+		if err := e.renameTable(ctx, txn, sess, s.Table, s.NewName, sch); err != nil {
+			return nil, err
+		}
+		if err := e.commitTx(ctx, txn, owns); err != nil {
+			return nil, err
+		}
+		return &Result{Command: "ALTER TABLE"}, nil
+	}
+
+	// Process multi-action Cmds (RENAME COLUMN, ALTER COLUMN ..., ADD CONSTRAINT).
+	for _, cmd := range s.Cmds {
+		switch cmd.Subtype {
+		case ast.AlterRenameColumn:
+			oldName := strings.ToLower(cmd.Name)
+			newName := strings.ToLower(cmd.NewName)
+			found := false
+			for i, col := range sch.Cols {
+				if strings.EqualFold(col.Name, oldName) {
+					sch.Cols[i].Name = newName
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, newExecError("42703", "column %q of relation %q does not exist", oldName, s.Table)
+			}
+
+		case ast.AlterColumnType:
+			// Update the declared type/OID AND physically rewrite every stored row,
+			// casting column cmd.Name's value to the new type (or evaluating the
+			// USING expr per row when present). The rewrite is staged into the txn
+			// and committed atomically with the schema change, so a cast failure
+			// aborts the whole ALTER without partial corruption.
+			ci := sch.colIndex(cmd.Name)
+			if ci < 0 {
+				return nil, newExecError("42703", "column %q of relation %q does not exist", cmd.Name, s.Table)
+			}
+			newOID := oidForTypeName(cmd.TypeName)
+			if err := e.rewriteColumnType(ctx, txn, sess, sch, s.Table, ci, newOID, cmd.UsingExpr); err != nil {
+				return nil, err
+			}
+			sch.Cols[ci].TypeOID = newOID
+
+		case ast.AlterSetDefault:
+			ci := sch.colIndex(cmd.Name)
+			if ci < 0 {
+				return nil, newExecError("42703", "column %q of relation %q does not exist", cmd.Name, s.Table)
+			}
+			ds, err := classifyDefault(cmd.DefExpr)
+			if err != nil {
+				return nil, err
+			}
+			sch.Cols[ci].Default = ds
+
+		case ast.AlterDropDefault:
+			ci := sch.colIndex(cmd.Name)
+			if ci < 0 {
+				return nil, newExecError("42703", "column %q of relation %q does not exist", cmd.Name, s.Table)
+			}
+			sch.Cols[ci].Default = nil
+
+		case ast.AlterSetNotNull:
+			ci := sch.colIndex(cmd.Name)
+			if ci < 0 {
+				return nil, newExecError("42703", "column %q of relation %q does not exist", cmd.Name, s.Table)
+			}
+			sch.Cols[ci].NotNull = true
+
+		case ast.AlterDropNotNull:
+			ci := sch.colIndex(cmd.Name)
+			if ci < 0 {
+				return nil, newExecError("42703", "column %q of relation %q does not exist", cmd.Name, s.Table)
+			}
+			sch.Cols[ci].NotNull = false
+
+		case ast.AlterAddConstraint:
+			if err := e.alterAddConstraint(ctx, txn, sess, sch, s.Table, cmd.Constraint); err != nil {
+				return nil, err
+			}
+
+		case ast.AlterEnableRLS:
+			sch.RLSEnabled = true
+		case ast.AlterDisableRLS:
+			sch.RLSEnabled = false
+		case ast.AlterForceRLS:
+			sch.RLSForced = true
+		case ast.AlterNoForceRLS:
+			sch.RLSForced = false
+		}
 	}
 
 	raw, err := json.Marshal(sch)
@@ -176,4 +282,160 @@ func (e *execImpl) execAlterTable(ctx context.Context, s *ast.AlterTableStmt, se
 		return nil, err
 	}
 	return &Result{Command: "ALTER TABLE"}, nil
+}
+
+// rewriteColumnType physically converts every stored row's value for column ci
+// to the new type newOID (or to the value of usingExpr evaluated per row when
+// usingExpr is non-nil), staging the rewritten rows and refreshed index entries
+// into txn. A value that cannot be cast aborts with a clear error (22P02 / 42846)
+// and leaves the txn unconverted (the caller rolls back), so no partial
+// corruption occurs.
+func (e *execImpl) rewriteColumnType(ctx context.Context, txn *transactions.Txn, sess *session.Session, sch *tableSchema, table string, ci int, newOID uint32, usingExpr ast.Node) error {
+	sc, err := e.scanTable(ctx, txn, sess, table, table)
+	if err != nil {
+		return err
+	}
+	defs, err := e.loadIndexes(ctx, txn, sess, table)
+	if err != nil {
+		return err
+	}
+	// Only indexes covering the altered column need their entries refreshed.
+	var affected []indexDef
+	for _, d := range defs {
+		if d.hasColumn(sch.Cols[ci].Name) || d.isExpr() {
+			affected = append(affected, d)
+		}
+	}
+
+	// First pass: compute every converted row (failing fast on a bad cast before
+	// any mutation is staged), and delete affected index entries keyed under the
+	// OLD column type.
+	converted := make([][]Datum, len(sc.rows))
+	for i, r := range sc.rows {
+		old := r.cells[ci]
+		var nv Datum
+		if usingExpr != nil {
+			ev := &evaluator{
+				resolveCol:      rowResolver(sch, table, r.cells),
+				lookupComposite: e.compositeResolverCtx(ctx, sess),
+			}
+			v, eerr := ev.eval(usingExpr)
+			if eerr != nil {
+				return eerr
+			}
+			if v.null {
+				nv = Datum{Null: true}
+			} else {
+				txt, cerr := castTextToOID(v.text, newOID)
+				if cerr != nil {
+					return cerr
+				}
+				nv = Datum{Text: txt}
+			}
+		} else if old.Null {
+			nv = Datum{Null: true}
+		} else {
+			txt, cerr := castTextToOID(old.Text, newOID)
+			if cerr != nil {
+				return cerr
+			}
+			nv = Datum{Text: txt}
+		}
+		newCells := append([]Datum(nil), r.cells...)
+		newCells[ci] = nv
+		converted[i] = newCells
+
+		// Remove old index entries while the schema still carries the OLD OID.
+		if len(affected) > 0 {
+			if derr := e.indexEntries(txn, sess, sch, affected, r.cells, r.key, false); derr != nil {
+				return derr
+			}
+		}
+	}
+
+	// Flip the schema's column OID so the index encoder keys new entries under the
+	// NEW type, then write rows and add refreshed entries.
+	sch.Cols[ci].TypeOID = newOID
+	for i, r := range sc.rows {
+		e.txn.Buffer(txn, transactions.Mutation{Key: r.key, Value: encodeRow(converted[i])})
+		if len(affected) > 0 {
+			if derr := e.indexEntries(txn, sess, sch, affected, converted[i], r.key, true); derr != nil {
+				return derr
+			}
+		}
+	}
+	return nil
+}
+
+// castTextToOID validates and normalizes a PG text value to the canonical text
+// form of the target type OID, as ALTER COLUMN TYPE / CAST would. It returns a
+// clear error (22P02 invalid input syntax, or 42846 cannot cast) when the value
+// is not representable in the target type. Text-family targets accept anything.
+func castTextToOID(text string, oid uint32) (string, error) {
+	s := strings.TrimSpace(text)
+	switch oid {
+	case OIDInt2:
+		n, err := strconv.ParseInt(s, 10, 16)
+		if err != nil {
+			return "", newExecError("22P02", "invalid input syntax for type smallint: %q", text)
+		}
+		return strconv.FormatInt(n, 10), nil
+	case OIDInt4:
+		n, err := strconv.ParseInt(s, 10, 32)
+		if err != nil {
+			return "", newExecError("22P02", "invalid input syntax for type integer: %q", text)
+		}
+		return strconv.FormatInt(n, 10), nil
+	case OIDInt8, OIDOid:
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return "", newExecError("22P02", "invalid input syntax for type bigint: %q", text)
+		}
+		return strconv.FormatInt(n, 10), nil
+	case OIDFloat4:
+		f, err := strconv.ParseFloat(s, 32)
+		if err != nil {
+			return "", newExecError("22P02", "invalid input syntax for type real: %q", text)
+		}
+		return strconv.FormatFloat(f, 'g', -1, 32), nil
+	case OIDFloat8:
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return "", newExecError("22P02", "invalid input syntax for type double precision: %q", text)
+		}
+		return strconv.FormatFloat(f, 'g', -1, 64), nil
+	case OIDNumeric:
+		// Accept any well-formed decimal; keep the source text (canonical enough).
+		if _, ok := encodeCopyNumeric(s); !ok && !strings.EqualFold(s, "nan") {
+			return "", newExecError("22P02", "invalid input syntax for type numeric: %q", text)
+		}
+		return s, nil
+	case OIDBool:
+		switch strings.ToLower(s) {
+		case "t", "true", "1", "yes", "y", "on":
+			return "t", nil
+		case "f", "false", "0", "no", "n", "off":
+			return "f", nil
+		}
+		return "", newExecError("22P02", "invalid input syntax for type boolean: %q", text)
+	case OIDDate:
+		if _, ok := copyParseTime(s); !ok {
+			return "", newExecError("22P02", "invalid input syntax for type date: %q", text)
+		}
+		return s, nil
+	case OIDTimestamp, OIDTimestamptz:
+		if _, ok := copyParseTime(s); !ok {
+			return "", newExecError("22P02", "invalid input syntax for type timestamp: %q", text)
+		}
+		return s, nil
+	case OIDUUID:
+		if _, ok := encodeCopyUUID(s); !ok {
+			return "", newExecError("22P02", "invalid input syntax for type uuid: %q", text)
+		}
+		return strings.ToLower(s), nil
+	default:
+		// text/varchar/bpchar/name/json/jsonb/bytea and unknown: accept the value
+		// as-is (any value has a valid text representation in these types).
+		return text, nil
+	}
 }

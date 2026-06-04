@@ -60,19 +60,35 @@ func (e *execImpl) BeginExplicit(ctx context.Context, sess *session.Session) (*t
 }
 
 // CommitExplicit commits a multi-statement transaction (the wire layer's COMMIT).
-// A write-write conflict surfaces as SQLSTATE 40001 so the client retries the
-// whole transaction (first-committer-wins snapshot isolation).
-func (e *execImpl) CommitExplicit(ctx context.Context, tx *transactions.Txn) error {
+// Before committing it runs every DEFERRABLE constraint check deferred during
+// the transaction; if any fails the commit is aborted (the transaction is rolled
+// back) and the FK error (23503) is returned. A write-write conflict surfaces as
+// SQLSTATE 40001 so the client retries the whole transaction (first-committer-
+// wins snapshot isolation).
+func (e *execImpl) CommitExplicit(ctx context.Context, tx *transactions.Txn, sess *session.Session) error {
+	if st := e.deferred.peek(tx); st != nil && len(st.pending) > 0 {
+		// Re-run the deferred checks against the transaction's final snapshot
+		// (read-your-writes within tx). A surviving violation aborts the commit.
+		if err := e.runPendingChecks(ctx, tx, sess, st, nil); err != nil {
+			_ = e.txn.Rollback(ctx, tx)
+			e.deferred.clear(tx)
+			return err
+		}
+	}
 	if err := e.txn.Commit(ctx, tx); err != nil {
+		e.deferred.clear(tx)
 		if errors.Is(err, transactions.ErrWriteConflict) {
 			return newExecError("40001", "could not serialize access due to concurrent update")
 		}
 		return err
 	}
+	e.deferred.clear(tx)
 	return nil
 }
 
-// RollbackExplicit rolls back a multi-statement transaction (ROLLBACK).
+// RollbackExplicit rolls back a multi-statement transaction (ROLLBACK) and
+// discards its deferred-constraint state.
 func (e *execImpl) RollbackExplicit(ctx context.Context, tx *transactions.Txn) error {
+	e.deferred.clear(tx)
 	return e.txn.Rollback(ctx, tx)
 }

@@ -10,6 +10,7 @@ require (
 	github.com/lestrrat-go/jwx/v2 v2.1.1
 	github.com/lni/dragonboat/v4 v4.0.0-20250723143628-076c7f6497dc
 	go.opentelemetry.io/proto/otlp v1.3.1
+	golang.org/x/crypto v0.48.0
 	google.golang.org/grpc v1.81.1
 )
 
@@ -92,7 +93,6 @@ require (
 	github.com/viterin/vek v0.4.2 // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect

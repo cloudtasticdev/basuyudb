@@ -31,8 +31,23 @@ func rowResolver(sch *tableSchema, alias string, cells []Datum) func(fields []st
 	}
 }
 
-// execInsert inserts one row (milestone-3: single VALUES tuple).
+// execInsert inserts one or more rows. It dispatches to:
+//   - execInsertMultiRow when MultiRows carries more than one row (Task 1)
+//   - execInsertSelect for INSERT ... SELECT (Task 2)
+//   - the single-row VALUES path for the common case
 func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *session.Session, params []Datum) (*Result, error) {
+	// Task 1: multi-row VALUES
+	if len(s.MultiRows) > 0 {
+		return e.execInsertMultiRow(ctx, s, sess, params)
+	}
+
+	// Task 2: INSERT ... SELECT (SelectStmt with a real FROM / set-op / WITH)
+	if sel, ok := s.SelectStmt.(*ast.SelectStmt); ok {
+		if len(sel.FromClause) > 0 || sel.SetOp != ast.SetOpNone || sel.WithClause != nil {
+			return e.execInsertSelect(ctx, s, sess, params)
+		}
+	}
+
 	table := s.Relation.RelName
 
 	txn, owns, err := e.beginTx(ctx, sess.Auth)
@@ -118,6 +133,12 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 		cells[i] = d
 	}
 
+	// GENERATED ... AS (expr) STORED: compute from the assembled row, overriding
+	// any user-supplied value.
+	if err := e.applyGeneratedColumns(sch, table, cells, params); err != nil {
+		return nil, err
+	}
+
 	// NOT NULL enforcement.
 	for i, c := range sch.Cols {
 		if c.NotNull && cells[i].Null {
@@ -131,6 +152,13 @@ func (e *execImpl) execInsert(ctx context.Context, s *ast.InsertStmt, sess *sess
 	}
 	if err := e.enforceFKChild(ctx, txn, sess, sch, cells); err != nil {
 		return nil, err
+	}
+
+	// Row-Level Security WITH CHECK on the new row (INSERT command).
+	if rlsApplies(sch, sess) {
+		if err := e.rlsCheckNewRow(sch, sess, "INSERT", params, rowResolver(sch, table, cells)); err != nil {
+			return nil, err
+		}
 	}
 
 	// Compute the row key. otel_spans is keyed by (trace_id, span_id) via
@@ -250,7 +278,12 @@ func (e *execImpl) branchRowKey(sess *session.Session, table string, sch *tableS
 
 // execUpdate updates rows matching WHERE. On a feature branch writes are
 // copy-on-write to the branch prefix (by design).
+// When a FROM clause is present it delegates to execUpdateFrom (Task 3).
 func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *session.Session, params []Datum) (*Result, error) {
+	if len(s.FromClause) > 0 {
+		return e.execUpdateFrom(ctx, s, sess, params)
+	}
+
 	table := s.Relation.RelName
 	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
@@ -274,13 +307,24 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 	for _, r := range sc.rows {
 		oldCells := append([]Datum(nil), r.cells...)
 		cells := append([]Datum(nil), r.cells...)
-		ev := &evaluator{params: params, resolveCol: rowResolver(sch, table, cells)}
+		ev := &evaluator{params: params, resolveCol: rowResolver(sch, table, cells), sess: sess}
 		if s.WhereClause != nil {
 			wv, err := ev.eval(s.WhereClause)
 			if err != nil {
 				return nil, err
 			}
 			if !asBool(wv) {
+				continue
+			}
+		}
+		// RLS visibility (USING) decides which rows UPDATE may target. A hidden row
+		// is silently skipped (PostgreSQL does not error; it is simply not seen).
+		if rlsApplies(sch, sess) {
+			ok, err := e.rlsRowAllowed(sch, sess, "UPDATE", params, rowResolver(sch, table, oldCells))
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
 				continue
 			}
 		}
@@ -295,6 +339,10 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 			}
 			cells[idx] = Datum{Null: v.null, Text: v.text}
 		}
+		// Recompute GENERATED STORED columns from the updated row.
+		if err := e.applyGeneratedColumns(sch, table, cells, params); err != nil {
+			return nil, err
+		}
 		// NOT NULL, CHECK and FK (child-side) on the updated row.
 		for i, c := range sch.Cols {
 			if c.NotNull && cells[i].Null {
@@ -307,10 +355,18 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 		if err := e.enforceFKChild(ctx, txn, sess, sch, cells); err != nil {
 			return nil, err
 		}
-		// If this row's primary key changed and other tables reference it,
-		// block the change (ON UPDATE RESTRICT, the default).
-		if sch.PKIndex >= 0 && oldCells[sch.PKIndex].Text != cells[sch.PKIndex].Text {
-			if err := e.enforceFKParent(ctx, txn, sess, table, oldCells[sch.PKIndex].Text); err != nil {
+		// RLS WITH CHECK on the updated (NEW) row — the new values must satisfy the
+		// UPDATE WITH CHECK predicates, else 42501.
+		if rlsApplies(sch, sess) {
+			if err := e.rlsCheckNewRow(sch, sess, "UPDATE", params, rowResolver(sch, table, cells)); err != nil {
+				return nil, err
+			}
+		}
+		// If this row's primary key changed and other tables reference it, apply
+		// the ON UPDATE referential action (RESTRICT blocks; CASCADE/SET NULL
+		// propagate to the children).
+		if parentRowRefChanged(sch, oldCells, cells) {
+			if err := e.enforceFKParentUpdate(ctx, txn, sess, table, sch, oldCells, cells); err != nil {
 				return nil, err
 			}
 		}
@@ -366,7 +422,12 @@ func (e *execImpl) execUpdate(ctx context.Context, s *ast.UpdateStmt, sess *sess
 // execDelete deletes rows matching WHERE. On main the key is removed; on a
 // feature branch a tombstone is written to the branch prefix so the row is
 // hidden without mutating the parent (by design).
+// When a USING clause is present it delegates to execDeleteUsing (Task 4).
 func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *session.Session, params []Datum) (*Result, error) {
+	if len(s.UsingClause) > 0 {
+		return e.execDeleteUsing(ctx, s, sess, params)
+	}
+
 	table := s.Relation.RelName
 	txn, owns, err := e.beginTx(ctx, sess.Auth)
 	if err != nil {
@@ -389,7 +450,7 @@ func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *sess
 	count := 0
 	var affected [][]Datum
 	for _, r := range sc.rows {
-		ev := &evaluator{params: params, resolveCol: rowResolver(sch, table, r.cells)}
+		ev := &evaluator{params: params, resolveCol: rowResolver(sch, table, r.cells), sess: sess}
 		if s.WhereClause != nil {
 			wv, err := ev.eval(s.WhereClause)
 			if err != nil {
@@ -399,12 +460,21 @@ func (e *execImpl) execDelete(ctx context.Context, s *ast.DeleteStmt, sess *sess
 				continue
 			}
 		}
-		// FK parent-side: refuse to delete a row still referenced by a child
-		// (ON DELETE RESTRICT, the default).
-		if sch.PKIndex >= 0 {
-			if err := e.enforceFKParent(ctx, txn, sess, table, r.cells[sch.PKIndex].Text); err != nil {
+		// RLS visibility (USING) decides which rows DELETE may target; a hidden row
+		// is silently skipped.
+		if rlsApplies(sch, sess) {
+			ok, err := e.rlsRowAllowed(sch, sess, "DELETE", params, rowResolver(sch, table, r.cells))
+			if err != nil {
 				return nil, err
 			}
+			if !ok {
+				continue
+			}
+		}
+		// FK parent-side: refuse to delete a row still referenced by a child
+		// (ON DELETE RESTRICT, the default).
+		if err := e.enforceFKParent(ctx, txn, sess, table, sch, r.cells); err != nil {
+			return nil, err
 		}
 		bk := e.branchRowKey(sess, table, sch, r.cells, r.key)
 		if onBranch {

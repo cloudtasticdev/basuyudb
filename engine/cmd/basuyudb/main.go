@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"syscall"
@@ -65,12 +66,26 @@ func main() {
 
 	// --- PG wire v3 server (ADR-001; port 5432) ---
 	wireAddr := envStr("BASUYUDB_PG_ADDR", ":5432")
-	srv := wire.NewServer(wire.Config{
+	encKey := []byte(os.Getenv("BASUYUDB_ENCRYPTION_KEY"))
+	srv, err := wire.NewServer(wire.Config{
 		Addr: wireAddr,
 		Executor: exec,
 		DevMode: devMode,
 		Logger: logger,
+		// Durable SCRAM role store: persisted under the data dir, encrypted at
+		// rest with the same key as BadgerDB when one is configured.
+		RolesPath:     filepath.Join(dataDir, "roles.json"),
+		EncryptionKey: encKey,
+		// Bootstrap a role from env so SCRAM is usable from a clean install.
+		// Seeded only if BOTH are set AND the role is not already present.
+		BootstrapRole:     os.Getenv("BASUYUDB_BOOTSTRAP_ROLE"),
+		BootstrapPassword: os.Getenv("BASUYUDB_BOOTSTRAP_PASSWORD"),
 	})
+	if err != nil {
+		logger.Error("failed to construct PG wire server", "err", err)
+		_ = store.Close()
+		os.Exit(1)
+	}
 	if err := srv.Listen(); err != nil {
 		logger.Error("failed to bind PG wire listener", "err", err, "addr", wireAddr)
 		_ = store.Close()

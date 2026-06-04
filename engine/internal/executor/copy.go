@@ -62,12 +62,55 @@ func (e *execImpl) CopyFrom(ctx context.Context, sess *session.Session, table st
 	return n, nil
 }
 
-// FormatCopyData renders result rows as COPY wire payload (text or CSV).
-func FormatCopyData(res *Result, format, delimiter string, header bool) []byte {
-	if format == "csv" {
-		return formatCopyCSV(res, delimiter, header)
+// CopyTargetOIDs returns the type OIDs of the COPY target columns, in order.
+// When columns is empty it returns the OIDs of all table columns (the implicit
+// full-column COPY target). The wire layer uses these to drive typed binary
+// COPY FROM via ParseCopyDataBinary.
+func (e *execImpl) CopyTargetOIDs(ctx context.Context, sess *session.Session, table string, columns []string) ([]uint32, error) {
+	txn, owns, err := e.beginTx(ctx, sess.Auth)
+	if err != nil {
+		return nil, err
 	}
-	return formatCopyText(res, delimiter)
+	defer func() {
+		if owns {
+			_ = e.commitTx(ctx, txn, owns)
+		}
+	}()
+	sch, err := e.loadSchema(ctx, txn, sess, table)
+	if err != nil {
+		return nil, err
+	}
+	if len(columns) == 0 {
+		oids := make([]uint32, len(sch.Cols))
+		for i, cm := range sch.Cols {
+			oids[i] = cm.TypeOID
+		}
+		return oids, nil
+	}
+	oids := make([]uint32, len(columns))
+	for i, name := range columns {
+		idx := sch.colIndex(name)
+		if idx < 0 {
+			return nil, newExecError("42703", "column %q of relation %q does not exist", name, table)
+		}
+		oids[i] = sch.Cols[idx].TypeOID
+	}
+	return oids, nil
+}
+
+// FormatCopyData renders result rows as COPY wire payload. For format=="binary"
+// it returns the complete PGCOPY binary stream (signature + header + rows +
+// trailer); for "csv" a CSV payload; otherwise the PG text format. The binary
+// per-field encoding is keyed by each column's type OID in res.Columns.
+func FormatCopyData(res *Result, format, delimiter string, header bool) []byte {
+	switch format {
+	case "binary":
+		return formatCopyBinary(res)
+	case "csv":
+		return formatCopyCSV(res, delimiter, header)
+	default:
+		return formatCopyText(res, delimiter)
+	}
 }
 
 func formatCopyText(res *Result, delimiter string) []byte {
@@ -125,13 +168,37 @@ func formatCopyCSV(res *Result, delimiter string, header bool) []byte {
 	return b.Bytes()
 }
 
-// ParseCopyData parses a COPY input stream into rows (text or CSV). For CSV with
-// header, the first record is skipped.
+// ParseCopyData parses a COPY input stream into rows. For CSV with header the
+// first record is skipped. For format=="binary" it decodes the PGCOPY binary
+// stream; because the binary stream does not self-describe column type OIDs, the
+// fields are decoded with text fallback (each field's raw bytes become the cell
+// text). Callers that know the destination column OIDs should use
+// ParseCopyDataBinary instead for fully typed decoding (the CopyFrom path then
+// re-parses the text per the table's declared types, so binary scalars like
+// int4/float8/timestamp are best handled via ParseCopyDataBinary with OIDs).
 func ParseCopyData(data []byte, format, delimiter string, header bool, ncols int) ([][]Datum, error) {
-	if format == "csv" {
+	switch format {
+	case "binary":
+		// No OID context here: decode every field as raw bytes (OIDText path).
+		oids := make([]uint32, ncols)
+		for i := range oids {
+			oids[i] = OIDText
+		}
+		return parseCopyBinary(data, oids)
+	case "csv":
 		return parseCopyCSV(data, delimiter, header)
+	default:
+		return parseCopyText(data, delimiter)
 	}
-	return parseCopyText(data, delimiter)
+}
+
+// ParseCopyDataBinary decodes a PGCOPY binary stream using the destination
+// column type OIDs, producing fully typed PG text for each field (int2/int4/
+// int8, float4/float8, bool, text/varchar/bpchar/name, bytea, timestamp[tz],
+// date, uuid, json, jsonb, numeric). The wire layer should call this for binary
+// COPY FROM, passing the target table's column OIDs.
+func ParseCopyDataBinary(data []byte, oids []uint32) ([][]Datum, error) {
+	return parseCopyBinary(data, oids)
 }
 
 func parseCopyText(data []byte, delimiter string) ([][]Datum, error) {

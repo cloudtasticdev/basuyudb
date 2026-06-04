@@ -54,7 +54,7 @@ func TestTransactionCommitRollback(t *testing.T) {
 	if got := len(exec(t, ex, bg, sess, "SELECT * FROM t").Rows); got != 0 {
 		t.Fatalf("uncommitted rows must not be visible outside the txn, got %d", got)
 	}
-	if err := ex.CommitExplicit(bg, tx2); err != nil {
+	if err := ex.CommitExplicit(bg, tx2, sess); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(exec(t, ex, bg, sess, "SELECT * FROM t").Rows); got != 2 {

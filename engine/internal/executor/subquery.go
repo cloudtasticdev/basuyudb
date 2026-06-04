@@ -16,6 +16,10 @@ func (ev *evaluator) evalScalarSub(s *ast.SubLink) (value, error) {
 	if err != nil {
 		return value{}, err
 	}
+	// EXISTS (subquery): true when the subquery returns at least one row.
+	if s.Exists {
+		return boolValue(len(res.Rows) > 0), nil
+	}
 	if len(res.Rows) == 0 {
 		return value{null: true, oid: OIDText}, nil
 	}
@@ -37,6 +41,11 @@ func (ev *evaluator) evalScalarSub(s *ast.SubLink) (value, error) {
 // subquery. SQL three-valued logic: NULL on the left, or no match with a NULL
 // present, yields NULL; otherwise a boolean.
 func (ev *evaluator) evalIn(e *ast.A_Expr) (value, error) {
+	// Row IN-list: (a,b) IN ((1,2),(3,4)) — compare row-wise.
+	if lrow, ok := e.Lexpr.(*ast.RowExpr); ok {
+		return ev.evalRowIn(lrow, e)
+	}
+
 	lv, err := ev.eval(e.Lexpr)
 	if err != nil {
 		return value{}, err
@@ -90,6 +99,45 @@ func (ev *evaluator) evalIn(e *ast.A_Expr) (value, error) {
 	}
 	if sawNull {
 		// No match but a NULL was present: SQL yields UNKNOWN (NULL).
+		return value{null: true, oid: OIDBool}, nil
+	}
+	return value{text: "f", oid: OIDBool}, nil
+}
+
+// evalRowIn evaluates (a,b,...) IN ((..),(..),...). Each RHS list item must be
+// a RowExpr; the row matches if it equals any candidate row.
+func (ev *evaluator) evalRowIn(lrow *ast.RowExpr, e *ast.A_Expr) (value, error) {
+	la, err := ev.evalRowItems(lrow)
+	if err != nil {
+		return value{}, err
+	}
+	list, ok := e.Rexpr.(*ast.List)
+	if !ok {
+		return value{}, newExecError("0A000", "row IN requires a parenthesised list of rows")
+	}
+	sawNull := false
+	for _, it := range list.Items {
+		rrow, ok := it.(*ast.RowExpr)
+		if !ok {
+			return value{}, newExecError("0A000", "row IN list items must be rows")
+		}
+		ra, err := ev.evalRowItems(rrow)
+		if err != nil {
+			return value{}, err
+		}
+		eq, err := compareRows("=", la, ra)
+		if err != nil {
+			return value{}, err
+		}
+		if eq.null {
+			sawNull = true
+			continue
+		}
+		if asBool(eq) {
+			return value{text: "t", oid: OIDBool}, nil
+		}
+	}
+	if sawNull {
 		return value{null: true, oid: OIDBool}, nil
 	}
 	return value{text: "f", oid: OIDBool}, nil

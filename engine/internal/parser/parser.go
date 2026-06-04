@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/cloudtasticdev/basuyudb/engine/internal/ast"
 )
@@ -9,6 +10,15 @@ import (
 const (
 	maxSQLLength = 1 << 20 // 1 MiB hard cap ()
 )
+
+// parserPool reuses yyParserImpl instances across Parse calls. The generated
+// yyParse() allocates a fresh *yyParserImpl every call — and that struct embeds
+// the parse value-stack inline ([yyInitialStackSize]yySymType), the single
+// largest allocation of a typical parse. Pooling reuses that stack, which every
+// query (simple-query AND extended-protocol Parse) pays for. The Parse method
+// fully re-initializes parser state (yystate=0, char=-1, stack pointer reset)
+// on entry, so a reused instance is safe.
+var parserPool = sync.Pool{New: func() any { return &yyParserImpl{} }}
 
 // Parse parses a single SQL statement into the canonical ast.Node. It never
 // panics: any internal panic is recovered and converted to a ParseError with
@@ -26,7 +36,12 @@ func Parse(sql string) (node ast.Node, err error) {
 	}()
 
 	lex := newLexer(sql)
-	yyParse(lex)
+	// Pooled parser: reuse the value-stack instead of allocating it per call.
+	// On a panic inside Parse, the instance is simply not returned to the pool
+	// (the outer deferred recover converts it to a ParseError) — acceptable.
+	p := parserPool.Get().(*yyParserImpl)
+	p.Parse(lex)
+	parserPool.Put(p)
 
 	if lex.err != nil {
 		return nil, lex.err

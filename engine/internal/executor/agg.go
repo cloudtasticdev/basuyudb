@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,7 +15,12 @@ import (
 // isAggregateName reports whether a function name is a supported SQL aggregate.
 func isAggregateName(n string) bool {
 	switch n {
-	case "count", "sum", "avg", "min", "max":
+	case "count", "sum", "avg", "min", "max",
+		"array_agg", "string_agg", "json_agg", "jsonb_agg",
+		"json_object_agg", "jsonb_object_agg",
+		"bool_and", "bool_or", "every",
+		"percentile_cont", "percentile_disc", "mode",
+		"first", "last", "first_value", "last_value":
 		return true
 	}
 	return false
@@ -55,9 +61,170 @@ func needsAggregation(s *ast.SelectStmt) bool {
 
 // evalAggregate reduces one aggregate call over a group's rows.
 func evalAggregate(name string, f *ast.FuncCall, group []boundRow, params []Datum) (value, error) {
+	// Apply FILTER (WHERE expr) — only rows matching the condition contribute.
+	if f.Filter != nil {
+		var filteredGroup []boundRow
+		for _, row := range group {
+			ev := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			cond, err := ev.eval(f.Filter)
+			if err != nil || !asBool(cond) {
+				continue
+			}
+			filteredGroup = append(filteredGroup, row)
+		}
+		group = filteredGroup
+	}
+
 	if name == "count" && f.AggStar {
 		return value{text: strconv.Itoa(len(group)), oid: OIDInt8}, nil
 	}
+
+	// COUNT(DISTINCT col) / aggregate with DISTINCT: deduplicate on arg[0] value.
+	if f.AggDistinct && len(f.Args) > 0 {
+		seen := map[string]bool{}
+		var dedupedGroup []boundRow
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			v, err := ev2.eval(f.Args[0])
+			if err != nil || v.null {
+				continue
+			}
+			if !seen[v.text] {
+				seen[v.text] = true
+				dedupedGroup = append(dedupedGroup, row)
+			}
+		}
+		group = dedupedGroup
+	}
+
+	// Multi-arg or custom aggregates handled before the single-arg path.
+	switch name {
+	case "array_agg":
+		if len(f.Args) < 1 {
+			return value{null: true, oid: OIDTextArr}, nil
+		}
+		var elems []string
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			v, err := ev2.eval(f.Args[0])
+			if err != nil || v.null {
+				continue
+			}
+			elems = append(elems, v.text)
+		}
+		if len(elems) == 0 {
+			return value{null: true, oid: OIDTextArr}, nil
+		}
+		return value{text: "{" + strings.Join(elems, ",") + "}", oid: OIDTextArr}, nil
+
+	case "string_agg":
+		if len(f.Args) < 2 {
+			return value{null: true, oid: OIDText}, nil
+		}
+		sep := ""
+		if len(group) > 0 {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(group[0])}
+			sv, _ := ev2.eval(f.Args[1])
+			sep = sv.text
+		}
+		var parts []string
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			v, err := ev2.eval(f.Args[0])
+			if err != nil || v.null {
+				continue
+			}
+			parts = append(parts, v.text)
+		}
+		if len(parts) == 0 {
+			return value{null: true, oid: OIDText}, nil
+		}
+		return value{text: strings.Join(parts, sep), oid: OIDText}, nil
+
+	case "json_agg", "jsonb_agg":
+		if len(f.Args) < 1 {
+			return value{text: "[]", oid: OIDJSONB}, nil
+		}
+		var elems []string
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			v, err := ev2.eval(f.Args[0])
+			if err != nil {
+				continue
+			}
+			if v.null {
+				elems = append(elems, "null")
+				continue
+			}
+			s := v.text
+			if !strings.HasPrefix(s, "{") && !strings.HasPrefix(s, "[") && !strings.HasPrefix(s, `"`) {
+				s = `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+			}
+			elems = append(elems, s)
+		}
+		return value{text: "[" + strings.Join(elems, ",") + "]", oid: OIDJSONB}, nil
+
+	case "bool_and", "every":
+		if len(f.Args) < 1 {
+			return boolValue(true), nil
+		}
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			v, err := ev2.eval(f.Args[0])
+			if err != nil || v.null || !asBool(v) {
+				return boolValue(false), nil
+			}
+		}
+		return boolValue(true), nil
+
+	case "bool_or":
+		if len(f.Args) < 1 {
+			return boolValue(false), nil
+		}
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			v, err := ev2.eval(f.Args[0])
+			if err != nil || v.null {
+				continue
+			}
+			if asBool(v) {
+				return boolValue(true), nil
+			}
+		}
+		return boolValue(false), nil
+
+	case "json_object_agg", "jsonb_object_agg":
+		if len(f.Args) < 2 {
+			return value{text: "{}", oid: OIDJSONB}, nil
+		}
+		var b strings.Builder
+		b.WriteString("{")
+		first := true
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			k, err := ev2.eval(f.Args[0])
+			if err != nil || k.null {
+				continue
+			}
+			vv, err := ev2.eval(f.Args[1])
+			if err != nil {
+				continue
+			}
+			if !first {
+				b.WriteString(",")
+			}
+			first = false
+			b.WriteString(`"` + strings.ReplaceAll(k.text, `"`, `\"`) + `":`)
+			if vv.null {
+				b.WriteString("null")
+			} else {
+				b.WriteString(`"` + strings.ReplaceAll(vv.text, `"`, `\"`) + `"`)
+			}
+		}
+		b.WriteString("}")
+		return value{text: b.String(), oid: OIDJSONB}, nil
+	}
+
 	if len(f.Args) != 1 {
 		return value{}, newExecError("42883", "aggregate %q expects exactly one argument", name)
 	}
@@ -142,6 +309,132 @@ func evalAggregate(name string, f *ast.FuncCall, group []boundRow, params []Datu
 			}
 		}
 		return best, nil
+
+	case "percentile_cont", "percentile_disc":
+		// percentile_cont(fraction) WITHIN GROUP (ORDER BY expr)
+		if len(f.Args) < 1 {
+			return value{null: true, oid: OIDFloat8}, nil
+		}
+		ev0 := &evaluator{params: params}
+		fracVal, err := ev0.eval(f.Args[0])
+		if err != nil {
+			return value{null: true, oid: OIDFloat8}, nil
+		}
+		frac, _ := strconv.ParseFloat(fracVal.text, 64)
+
+		var sortExpr ast.Node
+		if f.WithinGroup != nil && len(f.WithinGroup.OrderBy) > 0 {
+			sortExpr = f.WithinGroup.OrderBy[0].Node
+		} else if len(f.Args) > 1 {
+			sortExpr = f.Args[1]
+		}
+
+		var floatVals []float64
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			if sortExpr == nil {
+				continue
+			}
+			v, e2 := ev2.eval(sortExpr)
+			if e2 != nil || v.null {
+				continue
+			}
+			fv, ferr := strconv.ParseFloat(v.text, 64)
+			if ferr != nil {
+				continue
+			}
+			floatVals = append(floatVals, fv)
+		}
+
+		if len(floatVals) == 0 {
+			return value{null: true, oid: OIDFloat8}, nil
+		}
+		sort.Float64s(floatVals)
+
+		if name == "percentile_disc" {
+			idx := int(math.Ceil(frac*float64(len(floatVals)))) - 1
+			if idx < 0 {
+				idx = 0
+			}
+			if idx >= len(floatVals) {
+				idx = len(floatVals) - 1
+			}
+			return value{text: strconv.FormatFloat(floatVals[idx], 'f', -1, 64), oid: OIDFloat8}, nil
+		}
+		// percentile_cont: linear interpolation
+		pos := frac * float64(len(floatVals)-1)
+		lo := int(pos)
+		hi := lo + 1
+		if hi >= len(floatVals) {
+			hi = len(floatVals) - 1
+		}
+		interp := floatVals[lo] + (pos-float64(lo))*(floatVals[hi]-floatVals[lo])
+		return value{text: strconv.FormatFloat(interp, 'f', -1, 64), oid: OIDFloat8}, nil
+
+	case "mode":
+		var sortExpr ast.Node
+		if f.WithinGroup != nil && len(f.WithinGroup.OrderBy) > 0 {
+			sortExpr = f.WithinGroup.OrderBy[0].Node
+		} else if len(f.Args) > 0 {
+			sortExpr = f.Args[0]
+		}
+		if sortExpr == nil {
+			return value{null: true, oid: OIDText}, nil
+		}
+		counts := map[string]int{}
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			v, err := ev2.eval(sortExpr)
+			if err != nil || v.null {
+				continue
+			}
+			counts[v.text]++
+		}
+		bestCount, bestVal := 0, ""
+		for val, cnt := range counts {
+			if cnt > bestCount {
+				bestCount = cnt
+				bestVal = val
+			}
+		}
+		if bestCount == 0 {
+			return value{null: true, oid: OIDText}, nil
+		}
+		return value{text: bestVal, oid: OIDText}, nil
+
+	case "first", "first_value":
+		if len(f.Args) < 1 {
+			return value{null: true, oid: OIDText}, nil
+		}
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			v, err := ev2.eval(f.Args[0])
+			if err != nil || v.null {
+				continue
+			}
+			return v, nil
+		}
+		return value{null: true, oid: OIDText}, nil
+
+	case "last", "last_value":
+		if len(f.Args) < 1 {
+			return value{null: true, oid: OIDText}, nil
+		}
+		var last value
+		hasVal := false
+		for _, row := range group {
+			ev2 := &evaluator{params: params, resolveCol: combinedResolver(row)}
+			v, err := ev2.eval(f.Args[0])
+			if err != nil || v.null {
+				continue
+			}
+			last = v
+			hasVal = true
+		}
+		if hasVal {
+			return last, nil
+		}
+		return value{null: true, oid: OIDText}, nil
 	}
 	return value{}, newExecError("42883", "unknown aggregate %q", name)
 }
