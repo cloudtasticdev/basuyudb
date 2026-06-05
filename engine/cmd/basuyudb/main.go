@@ -18,7 +18,9 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/cloudtasticdev/basuyudb/engine/internal/consensus"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/executor"
+	"github.com/cloudtasticdev/basuyudb/engine/internal/mgmt"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/otel"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/storage"
 	"github.com/cloudtasticdev/basuyudb/engine/internal/transactions"
@@ -58,11 +60,40 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Single-node transaction engine (managed-mode snapshots; the LocalCommitter
-	// is swapped for the Raft Propose path at Gate 4).
-	nodeID := uint64(1)
-	txnEngine := transactions.New(store, nodeID, nil)
+	// Transaction engine. Single-node by default (LocalCommitter); with
+	// BASUYUDB_CLUSTER_ENABLED=true it replicates through a dragonboat Raft node
+	// so writes are durable on a quorum and survive automatic leader failover —
+	// no external HA tooling (Patroni/etcd) required.
+	committer, replicaID, stopCluster, err := buildCommitter(logger, store, dataDir)
+	if err != nil {
+		logger.Error("failed to start cluster", "err", err)
+		_ = store.Close()
+		os.Exit(1)
+	}
+	defer stopCluster()
+	txnEngine := transactions.New(store, replicaID, committer)
 	exec := executor.New(store, txnEngine)
+
+	// --- management/membership REST surface (Patroni-style) ---
+	// When clustered, the committer IS a *consensus.Node which structurally
+	// satisfies mgmt.ClusterInfo. Start the management server on
+	// BASUYUDB_MANAGEMENT_PORT so HAProxy/Kubernetes can route to the primary
+	// and operators can mutate membership. Closed on shutdown.
+	var mgmtSrv *mgmt.Server
+	if port := os.Getenv("BASUYUDB_MANAGEMENT_PORT"); port != "" {
+		if node, ok := committer.(*consensus.Node); ok {
+			mgmtSrv = mgmt.NewServer(":"+port, node, logger,
+				mgmt.WithAdminToken(os.Getenv("BASUYUDB_MANAGEMENT_TOKEN")))
+			if err := mgmtSrv.Start(); err != nil {
+				logger.Error("failed to start management server", "err", err, "port", port)
+				_ = store.Close()
+				os.Exit(1)
+			}
+			defer func() { _ = mgmtSrv.Close() }()
+		} else {
+			logger.Info("management port set but node is single-node; management server not started", "port", port)
+		}
+	}
 
 	// --- PG wire v3 server (ADR-001; port 5432) ---
 	wireAddr := envStr("BASUYUDB_PG_ADDR", ":5432")

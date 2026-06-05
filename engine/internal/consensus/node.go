@@ -35,7 +35,10 @@ type Node struct {
 	stopOnce sync.Once
 }
 
-var _ transactions.Committer = (*Node)(nil)
+var (
+	_ transactions.Committer           = (*Node)(nil)
+	_ transactions.ReplicatedCommitter = (*Node)(nil)
+)
 
 // New starts a dragonboat NodeHost.
 func New(cfg Config) (*Node, error) {
@@ -99,12 +102,41 @@ func (n *Node) Propose(ctx context.Context, shardID uint64, batch []transactions
 	if len(batch) == 0 {
 		return nil
 	}
+	ctx, cancel := withProposeDeadline(ctx)
+	defer cancel()
 	cs := n.nh.GetNoOPSession(shardID)
 	_, err := n.nh.SyncPropose(ctx, cs, marshalBatch(batch))
 	if err != nil {
 		return fmt.Errorf("consensus: propose to shard %d: %w", shardID, err)
 	}
 	return nil
+}
+
+// ProposeTxn replicates a transaction's write batch through Raft, carrying the
+// proposer's read snapshot so the state machine performs a deterministic
+// first-committer-wins conflict check on apply. dragonboat forwards the proposal
+// to the leader from any replica, so any node may accept the write. SyncPropose
+// returns after the entry is committed and applied on THIS node, giving
+// read-your-writes on the same connection.
+//
+// Returns committed=false (no error) when the transaction lost the conflict race
+// (the engine maps this to ErrWriteConflict / SQLSTATE 40001). On success it
+// returns the commit index (the managed-mode commit timestamp).
+func (n *Node) ProposeTxn(ctx context.Context, shardID, readTS uint64, batch []transactions.Mutation) (committed bool, index uint64, err error) {
+	if len(batch) == 0 {
+		return true, n.ReadTimestamp(shardID), nil
+	}
+	ctx, cancel := withProposeDeadline(ctx)
+	defer cancel()
+	cs := n.nh.GetNoOPSession(shardID)
+	res, err := n.nh.SyncPropose(ctx, cs, marshalProposal(readTS, batch))
+	if err != nil {
+		return false, 0, fmt.Errorf("consensus: propose txn to shard %d: %w", shardID, err)
+	}
+	if res.Value == resultAborted {
+		return false, 0, nil
+	}
+	return true, res.Value, nil
 }
 
 // ReadTimestamp returns a safe managed-mode read timestamp for a shard (the
@@ -140,6 +172,20 @@ func (n *Node) LeaderID(shardID uint64) (uint64, bool) {
 		return 0, false
 	}
 	return id, ok
+}
+
+// defaultProposeTimeout bounds a replication round when the caller (e.g. the
+// executor, which uses context.Background()) supplies no deadline. dragonboat's
+// SyncPropose requires a deadline.
+const defaultProposeTimeout = 10 * time.Second
+
+// withProposeDeadline ensures ctx has a deadline for SyncPropose. If the caller
+// already set one, it is preserved; otherwise a default is applied.
+func withProposeDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultProposeTimeout)
 }
 
 // Stop shuts down the NodeHost (idempotent).

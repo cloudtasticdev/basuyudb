@@ -27,6 +27,7 @@ spec:
   ports:
     - { name: raft,   port: {{ .Values.ports.raft }},   targetPort: raft }
     - { name: gossip, port: {{ .Values.ports.gossip }}, targetPort: gossip }
+    - { name: mgmt,   port: {{ .Values.ports.management }}, targetPort: mgmt }
 {{- if .Values.podDisruptionBudget.enabled }}
 ---
 apiVersion: policy/v1

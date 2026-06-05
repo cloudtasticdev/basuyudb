@@ -34,6 +34,26 @@ type LocalCommitter struct{}
 
 func (LocalCommitter) Propose(context.Context, uint64, []Mutation) error { return nil }
 
+// DefaultShardID is the single Raft group that backs the whole keyspace in the
+// current single-shard cluster topology. (Multi-shard sharding is future work.)
+const DefaultShardID uint64 = 1
+
+// ReplicatedCommitter is the consensus dependency for a clustered (Raft) engine.
+// When the committer passed to New implements it, Commit replicates writes
+// THROUGH the log (the replicated state machine performs the conflict check and
+// applies at the Raft index) instead of flushing locally, and reads snapshot at
+// the state machine's applied index. consensus.Node implements it.
+type ReplicatedCommitter interface {
+	Committer
+	// ProposeTxn replicates a transaction's batch and returns committed=false
+	// (no error) when it lost a first-committer-wins race. index is the commit
+	// timestamp (Raft log index) on success.
+	ProposeTxn(ctx context.Context, shardID, readTS uint64, batch []Mutation) (committed bool, index uint64, err error)
+	// ReadTimestamp returns the highest commit timestamp (Raft index) applied
+	// locally — the safe snapshot for a new read.
+	ReadTimestamp(shardID uint64) uint64
+}
+
 // Txn is an in-flight transaction.
 type Txn struct {
 	ReadTS HLCTimestamp
@@ -78,6 +98,12 @@ type engine struct {
 	store storage.Store
 	hlc *HLC
 	committer Committer
+	// repl is non-nil when the committer is a Raft (ReplicatedCommitter). In that
+	// mode Commit proposes through the log and reads snapshot at the replicated
+	// state machine's applied index, rather than flushing locally with the local
+	// oracle. shardID is the Raft group serving this engine's keyspace.
+	repl ReplicatedCommitter
+	shardID uint64
 	// clock is the managed-mode timestamp oracle. It is strictly monotonic and
 	// drives BadgerDB read/commit timestamps. Reads see all commits with a
 	// commit timestamp <= the reader's snapshot.
@@ -92,7 +118,10 @@ func New(store storage.Store, nodeID uint64, committer Committer) TransactionEng
 	if committer == nil {
 		committer = LocalCommitter{}
 	}
-	e := &engine{store: store, hlc: NewHLC(nodeID), committer: committer}
+	e := &engine{store: store, hlc: NewHLC(nodeID), committer: committer, shardID: DefaultShardID}
+	if r, ok := committer.(ReplicatedCommitter); ok {
+		e.repl = r
+	}
 	// Resume the timestamp oracle from the highest committed version persisted in
 	// the store. On a fresh store MaxVersion is 0 → start at 1 (ts 0 reserved).
 	// On reopen this ensures a read snapshot (clock.Load) sees all previously
@@ -109,9 +138,14 @@ func (e *engine) HLC() *HLC { return e.hlc }
 
 func (e *engine) Begin(ctx context.Context, sess auth.Session) (*Txn, error) {
 	ts := e.hlc.Now()
+	readUint := e.clock.Load() // single-node: see everything committed so far
+	if e.repl != nil {
+		// Clustered: snapshot at the replicated state machine's applied index.
+		readUint = e.repl.ReadTimestamp(e.shardID)
+	}
 	return &Txn{
 		ReadTS: ts,
-		readUint: e.clock.Load(), // snapshot: see everything committed so far
+		readUint: readUint,
 		sess: sess,
 	}, nil
 }
@@ -185,6 +219,22 @@ func (e *engine) Commit(ctx context.Context, txn *Txn) error {
 	}
 	if len(txn.mutations) == 0 {
 		txn.done = true
+		return nil
+	}
+
+	// Clustered path: replicate THROUGH the Raft log. The replicated state
+	// machine performs the deterministic first-committer-wins conflict check and
+	// applies at the Raft index on every node (no local flush here). SyncPropose
+	// returns after this node has applied, giving read-your-writes.
+	if e.repl != nil {
+		txn.done = true
+		committed, _, err := e.repl.ProposeTxn(ctx, e.shardID, txn.readUint, txn.mutations)
+		if err != nil {
+			return err
+		}
+		if !committed {
+			return ErrWriteConflict
+		}
 		return nil
 	}
 

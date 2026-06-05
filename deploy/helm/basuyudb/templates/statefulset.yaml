@@ -29,7 +29,7 @@ spec:
       initContainers:
         # Clear stale BadgerDB + dragonboat lock/temp files left by an ungraceful
         # exit (OOMKill / SIGKILL), preventing CrashLoopBackOff on restart.
-        # MUST NOT reference MANIFEST-LOCK (does not exist in BadgerDB) — .
+        # MUST NOT reference MANIFEST-LOCK (does not exist in BadgerDB) — D10.
         - name: clear-locks
           image: busybox:1.36
           command:
@@ -73,7 +73,40 @@ spec:
               value: ":{{ .Values.ports.otlpGrpc }}"
             - name: BASUYUDB_MANAGEMENT_PORT
               value: "{{ .Values.ports.management }}"
-            # a design decision: canonical key is BASUYUDB_DEV_MODE (never DEV_MODE).
+            {{- /* Cluster formation: enabled only for multi-replica deployments.
+                   A single-replica pilot runs the LocalCommitter (no Raft). */}}
+            {{- if gt (int .Values.replicaCount) 1 }}
+            - name: BASUYUDB_CLUSTER_ENABLED
+              value: "true"
+            {{- /* This pod's Raft transport address via stable headless-service
+                   pod DNS: <pod>.<headless>.<ns>.svc.cluster.local:<raftPort>. */}}
+            - name: BASUYUDB_RAFT_ADDR
+              value: "$(POD_NAME).{{ include "basuyudb.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.ports.raft }}"
+            {{- /* Founding membership: pod ordinal i -> replica id i+1 (matches
+                   the binary's parseReplicaID: ordinal+1). Built as
+                   "id@host:port,..." across all replicas. */}}
+            - name: BASUYUDB_RAFT_PEERS
+              value: "{{- $top := . -}}
+                {{- $svc := include "basuyudb.fullname" . -}}
+                {{- $ns := .Release.Namespace -}}
+                {{- $port := .Values.ports.raft -}}
+                {{- $n := int .Values.replicaCount -}}
+                {{- range $i := until $n -}}
+                  {{- if $i }},{{ end -}}
+                  {{ add $i 1 }}@{{ $svc }}-{{ $i }}.{{ $svc }}-headless.{{ $ns }}.svc.cluster.local:{{ $port }}
+                {{- end -}}"
+            {{- else }}
+            - name: BASUYUDB_CLUSTER_ENABLED
+              value: "false"
+            {{- end }}
+            {{- if .Values.managementToken }}
+            - name: BASUYUDB_MANAGEMENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "basuyudb.fullname" . }}-mgmt-token
+                  key: token
+            {{- end }}
+            # Canonical key is BASUYUDB_DEV_MODE (never DEV_MODE).
             - name: BASUYUDB_DEV_MODE
               value: {{ .Values.devMode | quote }}
             - name: BASUYUDB_LOG_LEVEL
@@ -89,6 +122,26 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if gt (int .Values.replicaCount) 1 }}
+          {{- /* Clustered: probe the management HTTP server. Liveness uses
+                 /health (process is up). Readiness uses /health too so a
+                 follower stays in the Service endpoints for read routing;
+                 write traffic is steered to the primary by probing /leader
+                 (HAProxy/PgCat), not by gating pod readiness. */}}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: mgmt
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: mgmt
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          {{- else }}
+          {{- /* Single-node pilot: no management server; probe the PG wire port. */}}
           readinessProbe:
             tcpSocket:
               port: pg-wire
@@ -99,10 +152,11 @@ spec:
               port: pg-wire
             initialDelaySeconds: 15
             periodSeconds: 20
+          {{- end }}
           lifecycle:
             preStop:
               exec:
-                # Sleep only (no SIGTERM here) — . The engine's own signal
+                # Sleep only (no SIGTERM here) — D10. The engine's own signal
                 # handler flushes BadgerDB on the real SIGTERM from kubelet.
                 command: ["/bin/sleep", "5"]
           volumeMounts:

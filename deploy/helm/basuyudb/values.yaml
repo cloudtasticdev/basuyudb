@@ -1,19 +1,27 @@
-# BasuyuDB Helm values (K3s, ADR-018 / the design specs).
+# BasuyuDB Helm values (K3s, ADR-018).
 
 image:
   repository: ghcr.io/cloudtasticdev/basuyudb
-  tag: "0.1.0"
+  tag: "0.5.0"
   pullPolicy: IfNotPresent
 
 # 3-node Raft cluster by default (Gate 4). Set to 1 for a single-node pilot.
 replicaCount: 3
 
 # Trust-auth dev mode. MUST be false in production (PassportAuth JWT auth).
-# Rendered as BASUYUDB_DEV_MODE (NOT DEV_MODE) — a design decision.
+# Rendered as BASUYUDB_DEV_MODE (NOT DEV_MODE) — canonical env key.
 devMode: false
 
 # Optional at-rest encryption key (base64). Empty = unencrypted.
 encryptionKey: ""
+
+# Optional admin bearer token gating the membership-mutating management
+# endpoints (POST /members/add, /members/remove). Empty = mutations are
+# unauthenticated (still logged). When set, the chart expects a Secret named
+# <fullname>-mgmt-token with a "token" key and wires it as
+# BASUYUDB_MANAGEMENT_TOKEN. The read-only health/leader/status endpoints are
+# always unauthenticated (probed by HAProxy/Kubernetes like Patroni).
+managementToken: ""
 
 storage:
   # Local NVMe only — NOT network-attached (ADR-018). K3s ships local-path.
@@ -30,7 +38,7 @@ resources:
     memory: 8Gi
 
 # terminationGracePeriodSeconds gives badger.DB.Close() + dragonboat shutdown
-# time to flush before SIGKILL (by design).
+# time to flush before SIGKILL (G-ADR-26).
 terminationGracePeriodSeconds: 90
 
 # PodDisruptionBudget keeps a Raft quorum during voluntary disruptions.
@@ -38,7 +46,7 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 2
 
-# Anti-affinity is REQUIRED so replicas land on distinct nodes (by design).
+# Anti-affinity is REQUIRED so replicas land on distinct nodes.
 antiAffinity: required
 
 raft:

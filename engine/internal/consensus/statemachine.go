@@ -29,12 +29,39 @@ func newStateMachineFunc(store storage.Store) func(shardID, replicaID uint64) sm
 	}
 }
 
+// resultAborted (sm.Result.Value == 0) tells the proposer its transaction lost a
+// first-committer-wins race. Raft log indices start at 1, so a committed entry
+// always reports a non-zero index — 0 is unambiguous.
+const resultAborted uint64 = 0
+
 // Update applies one committed entry. The Raft log Index is the managed-mode
 // commit timestamp, guaranteeing monotonic, deterministic application.
+//
+// It also performs the transaction's snapshot conflict check HERE, on apply,
+// rather than on the proposing node before proposing. Because every replica
+// applies the same entry against an identical store state (all prior entries
+// applied at the same indices), the abort/commit decision is deterministic and
+// the stores converge. This is what makes first-committer-wins snapshot
+// isolation correct under replication and across leader failover: a write that
+// raced with a newer committed version of any of its keys (version > the
+// proposer's readTS) is rejected uniformly on all nodes.
 func (s *stateMachine) Update(e sm.Entry) (sm.Result, error) {
-	muts, err := unmarshalBatch(e.Cmd)
+	readTS, muts, err := unmarshalProposal(e.Cmd)
 	if err != nil {
 		return sm.Result{}, err
+	}
+	// Deterministic first-committer-wins conflict check.
+	for _, m := range muts {
+		ts, found, verr := s.store.LatestVersion(m.key)
+		if verr != nil {
+			return sm.Result{}, verr
+		}
+		if found && ts > readTS {
+			// Conflict: apply nothing, but still advance the applied index so the
+			// log position is consumed identically on every replica.
+			s.lastApplied.Store(e.Index)
+			return sm.Result{Value: resultAborted}, nil
+		}
 	}
 	wb := s.store.NewWriteBatchAt(e.Index)
 	for _, m := range muts {
@@ -54,7 +81,9 @@ func (s *stateMachine) Update(e sm.Entry) (sm.Result, error) {
 		return sm.Result{}, err
 	}
 	s.lastApplied.Store(e.Index)
-	return sm.Result{Value: uint64(len(muts))}, nil
+	// Report the commit index (non-zero) so the proposer learns the committed
+	// version and can wait for local read-your-writes if needed.
+	return sm.Result{Value: e.Index}, nil
 }
 
 // LastApplied returns the highest Raft index applied (the safe read timestamp).
